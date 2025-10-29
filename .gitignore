@@ -1,8 +1,23 @@
+# Dependencies
 package-lock.json
 node_modules/
 dist/
+
+# Environment files (contém dados específicos)
 .env
+
+# Generated files (específicos para cada aplicação)
 links_map.json
 links_map.ts
+links_map.js
+
+# Screenshots (podem conter dados sensíveis)
+screenshots/
 !screenshots/.gitkeep
+
+# Logs (podem conter dados específicos)
 relatorio_logs.txt
+*.log
+
+# Arquivos de configuração local específicos (se houver)
+config.local.json

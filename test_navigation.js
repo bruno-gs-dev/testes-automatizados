@@ -2,7 +2,7 @@
 // Esta versão contém a lógica de expansão recursiva correta.
 
 import chalk from 'chalk';
-import { URL_ALVO, prepareBrowserPage, showStatus, LOGIN_CONFIG } from './utils.js';
+import { URL_ALVO, prepareBrowserPage, showStatus, LOGIN_CONFIG, getCustomSelectors, detectApplicationType } from './utils.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -14,26 +14,33 @@ import { fileURLToPath } from 'url';
 export async function discoverLinks(page) {
   await showStatus(page, 'Mapeando: Iniciando descoberta de links...');
   
-  const mainPanelSelector = 'fuse-vertical-navigation > div.fuse-vertical-navigation-wrapper > div.fuse-vertical-navigation-content';
-  const mainPanelItemsSelector = `${mainPanelSelector} > fuse-vertical-navigation-basic-item, ${mainPanelSelector} > fuse-vertical-navigation-aside-item`;
+  // NOVO: Detectar tipo de aplicação e usar seletores apropriados
+  const appType = await detectApplicationType(page);
+  const selectors = getCustomSelectors();
   
-  const asideWrapperSelector = 'div.fuse-vertical-navigation-aside-wrapper > fuse-vertical-navigation-aside-item > div.fuse-vertical-navigation-item-children';
-  const finalLinkSelector = `${asideWrapperSelector} fuse-vertical-navigation-basic-item a`;
+  console.log(chalk.gray(`Usando configuração de navegação: ${appType}`));
+  console.log(chalk.gray(`Seletores: ${JSON.stringify(selectors, null, 2)}`));
+  
+  const mainPanelSelector = selectors.mainPanel;
+  const mainPanelItemsSelector = selectors.mainItems;
+  const asideWrapperSelector = selectors.asideWrapper;
+  const finalLinkSelector = `${asideWrapperSelector} ${selectors.finalLink}`;
   
   /**
    * Esta função procura repetidamente por submenus fechados (collapsable-item)
    * e clica neles até que não haja mais nada para expandir.
    */
   async function expandAllSubMenus(page, wrapperSelector) {
+    const collapsableSelector = `${wrapperSelector} ${selectors.collapsable}`;
     
     // O seletor-chave: Procura o *alvo clicável* (<a> ou <div><div>)
     // DENTRO de um item que tenha a classe de "colapsado".
-    const collapsableSelector = `
-      ${wrapperSelector} fuse-vertical-navigation-collapsable-item.fuse-vertical-navigation-item-collapsed > a,
-      ${wrapperSelector} fuse-vertical-navigation-collapsable-item.fuse-vertical-navigation-item-collapsed > div > div
+    const collapsableItemSelector = `
+      ${collapsableSelector}.fuse-vertical-navigation-item-collapsed > a,
+      ${collapsableSelector}.fuse-vertical-navigation-item-collapsed > div > div
     `;
 
-    let closedSubMenus = await page.$$(collapsableSelector);
+    let closedSubMenus = await page.$$(collapsableItemSelector);
     let iterations = 0; // Prevenção de loop infinito
     
     while (closedSubMenus.length > 0 && iterations < 10) {
@@ -51,73 +58,74 @@ export async function discoverLinks(page) {
       
       iterations++;
       // Procura novamente para ver se novos submenus apareceram
-      closedSubMenus = await page.$$(collapsableSelector);
+      closedSubMenus = await page.$$(collapsableItemSelector);
     }
   }
 
 
+  // NOVO: Busca mais genérica por itens de navegação
   const mainNavHandles = await page.$$(mainPanelItemsSelector);
   const discoveredLinks = new Map();
 
   console.log(chalk.gray(`Encontrados ${mainNavHandles.length} itens no menu principal. Iterando...`));
 
   for (const handle of mainNavHandles) {
-    const itemInfo = await handle.evaluate(el => {
+    const itemInfo = await handle.evaluate((el, clickSelector) => {
       const tagName = el.tagName.toLowerCase();
-      const span = el.querySelector('span');
+      const span = el.querySelector('span') || el.querySelector('.text') || el;
       const text = span ? span.innerText.trim() : (el.innerText || '').trim();
       let href = null;
-      if (tagName === 'fuse-vertical-navigation-basic-item') {
-        const a = el.querySelector('a');
-        if (a && a.href && a.href.startsWith(window.location.origin) && !a.href.endsWith('#')) {
-          href = a.href;
-        }
+      
+      // Busca por link direto
+      const anchor = el.querySelector('a') || (el.tagName === 'A' ? el : null);
+      if (anchor && anchor.href && anchor.href.startsWith(window.location.origin) && !anchor.href.endsWith('#')) {
+        href = anchor.href;
       }
-      return { tagName, text, href };
-    });
+      
+      // Verifica se é clicável (categoria)
+      const isClickable = el.querySelector(clickSelector) || el.matches(clickSelector);
+      
+      return { tagName, text, href, isClickable };
+    }, selectors.clickTarget);
 
-    if (itemInfo.tagName === 'fuse-vertical-navigation-basic-item' && itemInfo.href) {
-      // É um link direto (ex: "Home")
+    if (itemInfo.href) {
+      // É um link direto
       console.log(chalk.cyan(`  [+] Link direto encontrado:`), itemInfo.text); 
       if (!discoveredLinks.has(itemInfo.href)) {
         discoveredLinks.set(itemInfo.href, { text: itemInfo.text, href: itemInfo.href });
       }
-    } else if (itemInfo.tagName === 'fuse-vertical-navigation-aside-item') {
-      // É uma CATEGORIA (ex: "Tráfego")
+    } else if (itemInfo.isClickable) {
+      // É uma categoria clicável
       console.log(chalk.blueBright(`  [*] Clicando categoria:`), itemInfo.text); 
       await showStatus(page, `Mapeando: ${itemInfo.text}...`);
       
       try {
-        const clicked = await handle.evaluate(el => {
-          const target = el.querySelector('div > div'); 
+        const clicked = await handle.evaluate((el, clickSelector) => {
+          const target = el.querySelector(clickSelector) || el;
           if (target && typeof target.click === 'function') {
             target.click();
             return true;
           }
           return false;
-        });
+        }, selectors.clickTarget);
 
-        if (!clicked) throw new Error('Elemento "div > div" interno não foi encontrado.');
+        if (!clicked) throw new Error('Elemento clicável não foi encontrado.');
         
-        await new Promise(r => setTimeout(r, 750)); // Espera o 'aside-wrapper' aparecer
+        await new Promise(r => setTimeout(r, 750));
 
-        // 4. CHAMA A FUNÇÃO DE EXPANSÃO TOTAL
-        console.log(chalk.gray(`    Iniciando expansão total para "${itemInfo.text}"...`));
-        await expandAllSubMenus(page, asideWrapperSelector); // Passa o wrapper onde ele deve procurar
-        console.log(chalk.gray(`    Expansão total concluída para "${itemInfo.text}".`));
+        await expandAllSubMenus(page, asideWrapperSelector);
         
-        // 5. Coleta todos os links finais (AGORA VAI PEGAR TODOS)
         const finalLinks = await page.evaluate((selector) => {
           const links = [];
           document.querySelectorAll(selector).forEach(a => {
-            const span = a.querySelector('span');
+            const span = a.querySelector('span') || a.querySelector('.text') || a;
             const text = span ? span.innerText.trim() : a.innerText.trim();
             if (a.href && a.href.startsWith(window.location.origin) && !a.href.endsWith('#')) {
               links.push({ text, href: a.href });
             }
           });
           return links;
-        }, finalLinkSelector); // Usa o seletor de links (basic-item)
+        }, finalLinkSelector);
 
         console.log(chalk.gray(`    Encontrados ${finalLinks.length} links em "${itemInfo.text}".`));
         finalLinks.forEach(link => {

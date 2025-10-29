@@ -4,6 +4,7 @@ import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { getNavigationConfig } from './config/navigation.config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,8 +25,8 @@ const toList = (v) => {
   return String(v).split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
 };
 
-// Lidos do .env
-export const URL_ALVO = process.env.URL_ALVO || 'https://smartviaamc.atlantatecnologia.com.br/app/paginainicial';
+// Lidos do .env - REMOVIDO: URL específica hardcoded
+export const URL_ALVO = process.env.URL_ALVO || 'https://exemplo.com/app/home';
 
 export const PALETA_CORES_PERMITIDAS = (
   process.env.PALETA_CORES_PERMITIDAS
@@ -49,21 +50,21 @@ export function normalizeColor(colorString) {
   return colorString.toLowerCase();
 }
 
-// NOVO: Configuração de login centralizada (vinda do .env)
+// ATUALIZADO: Configuração de login centralizada (vinda do .env) - REMOVIDO: dados específicos
 export const LOGIN_CONFIG = {
-  idVerificacao: toNum(process.env.LOGIN_ID_VERIFICACAO, 40),
-  expectedPath: process.env.EXPECTED_PATH || '/app/paginainicial',
-  idSistema: toNum(process.env.LOGIN_ID_SISTEMA, 11),
-  idContrato: (process.env.LOGIN_ID_CONTRATO ? toList(process.env.LOGIN_ID_CONTRATO).map(n => toNum(n, null)).filter(n => n != null) : [7]),
-  nomeSistema: process.env.LOGIN_NOME_SISTEMA || 'SMARTVIA',
-  contratoNome: process.env.LOGIN_CONTRATO_NOME || 'AMC VIAS INTELIGENTES',
-  url: process.env.BASE_URL || 'https://smartviaamc.atlantatecnologia.com.br/',
-  username: process.env.LOGIN_USERNAME || 'bruno.gomes',
-  password: process.env.LOGIN_PASSWORD || 'a123456',
+  idVerificacao: toNum(process.env.LOGIN_ID_VERIFICACAO, null),
+  expectedPath: process.env.EXPECTED_PATH || '/app/home',
+  idSistema: toNum(process.env.LOGIN_ID_SISTEMA, null),
+  idContrato: (process.env.LOGIN_ID_CONTRATO ? toList(process.env.LOGIN_ID_CONTRATO).map(n => toNum(n, null)).filter(n => n != null) : []),
+  nomeSistema: process.env.LOGIN_NOME_SISTEMA || '',
+  contratoNome: process.env.LOGIN_CONTRATO_NOME || '',
+  url: process.env.BASE_URL || 'https://exemplo.com/',
+  username: process.env.LOGIN_USERNAME || '',
+  password: process.env.LOGIN_PASSWORD || '',
   selectors: {
-    username: process.env.LOGIN_SELECTOR_USERNAME || '#email',
-    password: process.env.LOGIN_SELECTOR_PASSWORD || '#password',
-    submit: process.env.LOGIN_SELECTOR_SUBMIT || "button:contains('Entrar')"
+    username: process.env.LOGIN_SELECTOR_USERNAME || 'input[type="email"], input[type="text"], input[name*="user"], input[name*="email"]',
+    password: process.env.LOGIN_SELECTOR_PASSWORD || 'input[type="password"]',
+    submit: process.env.LOGIN_SELECTOR_SUBMIT || 'button[type="submit"], input[type="submit"], button:contains("Entrar"), button:contains("Login")'
   }
 };
 
@@ -146,17 +147,118 @@ async function clickButtonByTextInFrame(frame, text) {
   return false;
 }
 
-// NOVO: realizar login (suporte a frames e busca por texto sem XPath, com digitação real)
+// NOVO: Configuração de navegação baseada no tipo
+export const getNavConfig = () => {
+  const navType = process.env.NAV_TYPE || 'generic';
+  return getNavigationConfig(navType);
+};
+
+// NOVO: Seletores customizáveis via .env (com fallback para padrões)
+export const getCustomSelectors = () => {
+  const navConfig = getNavConfig();
+  
+  return {
+    mainPanel: process.env.NAV_MAIN_PANEL_SELECTOR || navConfig.mainPanelSelector,
+    mainItems: process.env.NAV_MAIN_ITEMS_SELECTOR || navConfig.mainItemsSelector,
+    asideWrapper: process.env.NAV_ASIDE_WRAPPER_SELECTOR || navConfig.asideWrapperSelector,
+    finalLink: process.env.NAV_FINAL_LINK_SELECTOR || navConfig.finalLinkSelector,
+    collapsable: process.env.NAV_COLLAPSABLE_SELECTOR || navConfig.collapsableSelector,
+    clickTarget: process.env.NAV_CLICK_TARGET_SELECTOR || navConfig.clickTargetSelector
+  };
+};
+
+// NOVO: Detectar tipo de aplicação automaticamente
+export async function detectApplicationType(page) {
+  const types = await page.evaluate(() => {
+    const checks = {
+      angular_fuse: !!document.querySelector('fuse-vertical-navigation'),
+      bootstrap: !!document.querySelector('.navbar, .nav, [class*="bootstrap"]') || !!window.bootstrap,
+      react: !!document.querySelector('[data-reactroot], #root, #__next') || !!window.React,
+      vue: !!document.querySelector('[data-v-], #app') || !!window.Vue,
+      generic: true
+    };
+    
+    // Retorna o primeiro tipo detectado (exceto generic)
+    for (const [type, detected] of Object.entries(checks)) {
+      if (detected && type !== 'generic') return type;
+    }
+    return 'generic';
+  });
+  
+  console.log(chalk.gray(`Tipo de aplicação detectado: ${types}`));
+  return types;
+}
+
+// ATUALIZADO: função de login mais genérica - REMOVIDO: lógica específica
 export async function performLogin(page, loginConfig) {
   const baseUrl = loginConfig.url;
   const expectedPath = loginConfig.expectedPath || '/';
 
+  // NOVO: Verificar se login é necessário
+  if (!loginConfig.username || !loginConfig.password) {
+    console.log(chalk.yellow('Aviso: Credenciais de login não fornecidas. Pulando login.'));
+    return true;
+  }
+
   await showStatus(page, 'Acessando tela de login...');
   await page.goto(baseUrl, { waitUntil: 'networkidle2' }).catch(() => {});
 
-  const selUser = loginConfig.selectors.username;
-  const selPass = loginConfig.selectors.password;
-  const selSubmit = loginConfig.selectors.submit;
+  // ATUALIZADO: Detectar automaticamente seletores se não fornecidos - MELHORADO
+  const autoDetectedSelectors = await page.evaluate(() => {
+    let usernameField = null, passwordField = null, submitButton = null;
+    
+    // Busca mais abrangente por campos de input
+    const usernameInputs = document.querySelectorAll([
+      'input[type="email"]',
+      'input[type="text"]',
+      'input[name*="user"]',
+      'input[name*="email"]',
+      'input[name*="login"]',
+      'input[id*="user"]',
+      'input[id*="email"]',
+      'input[id*="login"]',
+      'input[placeholder*="email" i]',
+      'input[placeholder*="user" i]',
+      'input[placeholder*="login" i]'
+    ].join(', '));
+    
+    const passwordInputs = document.querySelectorAll('input[type="password"]');
+    
+    const submitButtons = document.querySelectorAll([
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:contains("Entrar")',
+      'button:contains("Login")',
+      'button:contains("Sign in")',
+      'button:contains("Conectar")',
+      'button:contains("Acessar")',
+      '.btn-login',
+      '.login-btn',
+      '.submit-btn'
+    ].join(', '));
+    
+    if (usernameInputs.length > 0) {
+      const input = usernameInputs[0];
+      usernameField = input.id ? `#${input.id}` : (input.name ? `[name="${input.name}"]` : `input[type="${input.type}"]`);
+    }
+    
+    if (passwordInputs.length > 0) {
+      const input = passwordInputs[0];
+      passwordField = input.id ? `#${input.id}` : 'input[type="password"]';
+    }
+    
+    if (submitButtons.length > 0) {
+      const btn = submitButtons[0];
+      submitButton = btn.id ? `#${btn.id}` : (btn.className ? `.${btn.className.split(' ')[0]}` : 'button[type="submit"]');
+    }
+    
+    return { usernameField, passwordField, submitButton };
+  });
+
+  // ATUALIZADO: Usar seletores detectados como fallback
+  const selUser = loginConfig.selectors.username || autoDetectedSelectors.usernameField || 'input[type="email"], input[type="text"]';
+  const selPass = loginConfig.selectors.password || autoDetectedSelectors.passwordField || 'input[type="password"]';
+  const selSubmit = loginConfig.selectors.submit || autoDetectedSelectors.submitButton || 'button[type="submit"]';
 
   // Aguarda aparecerem os campos em qualquer frame (espera ativa, sem timeout do Puppeteer)
   let userFrame = null, passFrame = null;
