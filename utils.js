@@ -249,6 +249,11 @@ export async function detectApplicationType(page) {
 export async function performLogin(page, loginConfig) {
   const baseUrl = loginConfig.url;
   const expectedPath = loginConfig.expectedPath || '/';
+  // NOVO: Verificar se o login deve ser pulado
+  if (toBool(process.env.SKIP_LOGIN, false)) {
+    console.log(chalk.blue('Login pulado por configuração (SKIP_LOGIN=true).'));
+    return true;
+  }
 
   // NOVO: Verificar se login é necessário
   if (!loginConfig.username || !loginConfig.password) {
@@ -627,8 +632,10 @@ export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = 
 
   try {
     await showStatus(page, loginConfig ? 'Iniciando login...' : 'Carregando página alvo...');
-    if (loginConfig) {
+    if (loginConfig && !toBool(process.env.SKIP_LOGIN, false)) {
       await performLogin(page, loginConfig);
+    } else if (toBool(process.env.SKIP_LOGIN, false)) {
+      console.log(chalk.blue('Login pulado - navegando diretamente para a URL alvo.'));
     }
     await page.goto(url, { waitUntil: 'networkidle2' });
     await showStatus(page, 'Página carregada.');

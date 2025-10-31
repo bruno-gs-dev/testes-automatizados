@@ -185,16 +185,14 @@ async function main() {
     console.log(chalk.red.bold.inverse(' ❌ FALHA! '),'Foram encontrados', results.totalErros, 'problemas no total.');
   }
 
-  // NOVO: salvar logs em .txt e abrir no Bloco de Notas
+  // NOVO: salvar logs em .txt (sem abrir automaticamente)
   try {
     const logFile = path.join(__dirname, 'relatorio_logs.txt');
     fs.writeFileSync(logFile, LOG_BUFFER.join('\n'), 'utf8');
     console.log(chalk.gray(`\nLogs completos salvos em: ${logFile}`));
-    // abre no Bloco de Notas (Windows)
-    const child = spawn('notepad.exe', [logFile], { detached: true, stdio: 'ignore' });
-    child.unref();
+    // REMOVIDO: abertura automática do Bloco de Notas
   } catch (e) {
-    console.error('Falha ao salvar/abrir o arquivo de logs:', e.message);
+    console.error('Falha ao salvar o arquivo de logs:', e.message);
   }
 }
 
