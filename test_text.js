@@ -10,42 +10,62 @@ import { URL_ALVO, takeScreenshot, prepareBrowserPage, showStatus, LOGIN_CONFIG,
  */
 export async function checkTextOnPage(page) {
   await showStatus(page, 'Coletando textos e buscando "null"/"NaN"...');
-  // Novo: ler tokens adicionais do env (ex: "erro,indefinido") e montar regex
+
+  // Novo: aguardo opcional para SPAs renderizarem conteúdo
+  const waitMs = parseInt(process.env.WAIT_TEXT_READY_MS || '0', 10);
+  if (waitMs > 0) {
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+
+  // Novo: ler tokens adicionais do env e montar busca robusta
   const extraTokensEnv = process.env.SEARCH_TEXTS || '';
   const extraTokens = extraTokensEnv.split(/[,\r\n]+/).map(t => t.trim()).filter(Boolean);
   const baseTokens = ['null', 'nan']; // padrões sempre incluídos (case-insensitive)
-  const allTokens = [...baseTokens, ...extraTokens];
 
-  // função para escapar caracteres especiais em tokens para uso em regex
-  const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = `\\b(${allTokens.map(escapeRegex).join('|')})\\b`;
-  // passaremos o padrão como string para o contexto da página
-  const textIssues = await page.evaluate((regexSource) => {
-    const re = new RegExp(regexSource, 'i');
+  // Regex somente para null/nan (ASCII), extras por substring (case-insensitive)
+  const baseRegexSource = `\\b(?:${baseTokens.join('|')})\\b`;
+
+  const textIssues = await page.evaluate((baseReSrc, tokens) => {
+    const baseRe = new RegExp(baseReSrc, 'i');
+    const extra = (tokens || []).map(t => t.toLowerCase()).filter(Boolean);
 
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const IGNORE = (el) => el.closest('[data-qa-ignore="true"]') || el.id === '__qa_status_overlay';
 
-    // 1) Considera apenas div e span visíveis
-    const nodes = Array.from(document.querySelectorAll('div, span'))
-      .filter(el => isVisible(el) && !IGNORE(el));
+    // Ampliado: mais containers de texto comuns
+    const nodes = Array.from(document.querySelectorAll([
+      'div', 'span', 'p', 'a', 'button', 'li', 'label',
+      'h1','h2','h3','h4','h5','h6','td','th'
+    ].join(','))).filter(el => isVisible(el) && !IGNORE(el));
 
-    // 2) Coleta matches
     const matches = [];
     for (const el of nodes) {
-      const textContent = el.innerText;
+      const textContent = el.innerText || el.textContent || '';
       if (!textContent) continue;
-      const match = textContent.match(re);
-      if (match) {
-        matches.push({ el, text: textContent.trim().substring(0, 200), issueType: match[1] });
+      const textLower = textContent.toLowerCase();
+
+      // 1) null/nan por regex com borda de palavra (ASCII)
+      const m = textLower.match(baseRe);
+      if (m) {
+        matches.push({ el, text: textContent.trim().substring(0, 200), issueType: m[0] });
+        continue; // evita duplicar se já marcou por baseRe
+      }
+
+      // 2) extras por substring case-insensitive (robusto para acentos)
+      for (const tok of extra) {
+        if (!tok) continue;
+        if (textLower.includes(tok)) {
+          matches.push({ el, text: textContent.trim().substring(0, 200), issueType: tok });
+          break;
+        }
       }
     }
 
-    // 3) Mantém apenas o nó mais específico (remove pais que contém outros nós com match)
+    // Mantém apenas o nó mais específico (remove pais que contêm filhos com match)
     const matchedEls = matches.map(m => m.el);
     const deepest = matches.filter(m => !matchedEls.some(other => other !== m.el && m.el.contains(other)));
 
-    // 4) Gera seletores únicos aplicando o atributo no próprio span/div alvo
+    // Gera seletores únicos
     const results = [];
     let elementIdCounter = 0;
     for (const m of deepest) {
@@ -58,7 +78,7 @@ export async function checkTextOnPage(page) {
       });
     }
     return results;
-  }, pattern);
+  }, baseRegexSource, extraTokens);
 
   await showStatus(page, 'Gerando relatório de texto...');
   console.log(chalk.bold('\n--- Relatório de Conteúdo de Texto (Página) ---'));
@@ -118,7 +138,7 @@ export async function checkTextOnPage(page) {
     }, item.selector);
     await clearElementHighlight(page, item.selector);
   }
-  if (textErrorCount === 0) console.log(chalk.green('Nenhum "null" ou "NaN" encontrado no texto.'));
+  if (textErrorCount === 0) console.log(chalk.green('Nenhum "null"/"NaN" nem token extra encontrado no texto.'));
   return { totalErros, textErrorCount };
 }
 

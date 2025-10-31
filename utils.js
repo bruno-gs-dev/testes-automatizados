@@ -25,6 +25,10 @@ const toList = (v) => {
   return String(v).split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
 };
 
+// NOVO: timeouts do login (lidos do .env, com defaults)
+const LOGIN_FIND_TIMEOUT = toNum(process.env.LOGIN_FIND_TIMEOUT, 8000);
+const LOGIN_CONFIRM_TIMEOUT = toNum(process.env.LOGIN_CONFIRM_TIMEOUT, 12000);
+
 // Lidos do .env - REMOVIDO: URL específica hardcoded
 export const URL_ALVO = process.env.URL_ALVO || 'https://exemplo.com/app/home';
 
@@ -102,25 +106,77 @@ async function getFrameWithSelector(page, selector) {
   return null;
 }
 
-// NOVO: digitar em input dentro de um frame disparando eventos (input/change/blur)
+// NOVO: helper para achar seletor em qualquer frame (com wait e handle) — agora respeita timeout=0 (verificação única, sem espera)
+async function waitForSelectorInAnyFrame(page, selector, timeout = 5000) {
+  if (!selector) return { frame: null, handle: null };
+  const scanOnce = async () => {
+    for (const frame of page.frames()) {
+      try {
+        const handle = await frame.$(selector);
+        if (handle) return { frame, handle };
+      } catch { /* ignore */ }
+    }
+    return { frame: null, handle: null };
+  };
+  if (!timeout || timeout <= 0) {
+    return await scanOnce();
+  }
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const found = await scanOnce();
+    if (found.frame && found.handle) return found;
+    await new Promise(r => setTimeout(r, 120));
+  }
+  return { frame: null, handle: null };
+}
+
+// NOVO: digitar em input dentro de um frame disparando eventos (robusto)
 async function fillInputInFrame(frame, selector, value) {
   try {
     const el = await frame.$(selector);
     if (!el) return false;
+
+    // NOVO: garantir que o elemento esteja visível na viewport antes de interagir
+    await frame.$eval(selector, (i) => {
+      try { i.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch {}
+    }).catch(() => {});
+
+    await el.focus().catch(() => {});
     await el.click({ clickCount: 3 }).catch(() => {});
-    // limpar selecionado
-    await el.press('Backspace').catch(() => {});
-    // digitar com delay para simular usuário
-    await frame.type(selector, value, { delay: 30 });
-    // garantir disparo de eventos e blur
+
+    // limpa via JS e dispara eventos
+    await frame.evaluate((sel) => {
+      const i = document.querySelector(sel);
+      if (!i) return;
+      i.value = '';
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+      i.dispatchEvent(new Event('change', { bubbles: true }));
+    }, selector);
+
+    // digita com delay
+    await frame.type(selector, value, { delay: 20 }).catch(() => {});
+
+    // garante eventos e blur
     await frame.$eval(selector, (input) => {
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
       input.blur();
     });
-    // confirmar valor persistido
-    const typed = await frame.$eval(selector, (i) => i.value);
-    return typed === value;
+
+    // valida
+    let typed = await frame.$eval(selector, (i) => i.value);
+    if (typed && typed.trim() === String(value)) return true;
+
+    // fallback: setar diretamente e disparar eventos
+    await frame.$eval(selector, (input, v) => {
+      input.value = v;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+    }, String(value));
+
+    typed = await frame.$eval(selector, (i) => i.value);
+    return !!typed && typed.trim() === String(value);
   } catch {
     return false;
   }
@@ -189,7 +245,7 @@ export async function detectApplicationType(page) {
   return types;
 }
 
-// ATUALIZADO: função de login mais genérica - REMOVIDO: lógica específica
+// ATUALIZADO: função de login mais genérica - CORRIGIDO: seletores CSS válidos
 export async function performLogin(page, loginConfig) {
   const baseUrl = loginConfig.url;
   const expectedPath = loginConfig.expectedPath || '/';
@@ -203,7 +259,7 @@ export async function performLogin(page, loginConfig) {
   await showStatus(page, 'Acessando tela de login...');
   await page.goto(baseUrl, { waitUntil: 'networkidle2' }).catch(() => {});
 
-  // ATUALIZADO: Detectar automaticamente seletores se não fornecidos - MELHORADO
+  // CORRIGIDO: Detectar automaticamente seletores sem usar :contains()
   const autoDetectedSelectors = await page.evaluate(() => {
     let usernameField = null, passwordField = null, submitButton = null;
     
@@ -216,26 +272,36 @@ export async function performLogin(page, loginConfig) {
       'input[name*="login"]',
       'input[id*="user"]',
       'input[id*="email"]',
-      'input[id*="login"]',
-      'input[placeholder*="email" i]',
-      'input[placeholder*="user" i]',
-      'input[placeholder*="login" i]'
+      'input[id*="login"]'
     ].join(', '));
     
     const passwordInputs = document.querySelectorAll('input[type="password"]');
     
+    // CORRIGIDO: Remover :contains() e usar seletores CSS válidos
     const submitButtons = document.querySelectorAll([
       'button[type="submit"]',
       'input[type="submit"]',
-      'button:contains("Entrar")',
-      'button:contains("Login")',
-      'button:contains("Sign in")',
-      'button:contains("Conectar")',
-      'button:contains("Acessar")',
       '.btn-login',
       '.login-btn',
-      '.submit-btn'
+      '.submit-btn',
+      'button.btn-primary',
+      'button.primary',
+      '[class*="submit"]',
+      '[class*="login"]'
     ].join(', '));
+    
+    // NOVO: Buscar botões por texto usando innerText (após querySelectorAll)
+    if (submitButtons.length === 0) {
+      const allButtons = document.querySelectorAll('button, input[type="button"], [role="button"]');
+      for (const btn of allButtons) {
+        const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase();
+        if (text.includes('entrar') || text.includes('login') || text.includes('sign in') || 
+            text.includes('conectar') || text.includes('acessar') || text.includes('submit')) {
+          submitButton = btn.id ? `#${btn.id}` : (btn.className ? `.${btn.className.split(' ')[0]}` : 'button');
+          break;
+        }
+      }
+    }
     
     if (usernameInputs.length > 0) {
       const input = usernameInputs[0];
@@ -247,7 +313,8 @@ export async function performLogin(page, loginConfig) {
       passwordField = input.id ? `#${input.id}` : 'input[type="password"]';
     }
     
-    if (submitButtons.length > 0) {
+    // Se não encontrou botão por classe, usar o primeiro botão de submit
+    if (!submitButton && submitButtons.length > 0) {
       const btn = submitButtons[0];
       submitButton = btn.id ? `#${btn.id}` : (btn.className ? `.${btn.className.split(' ')[0]}` : 'button[type="submit"]');
     }
@@ -255,88 +322,175 @@ export async function performLogin(page, loginConfig) {
     return { usernameField, passwordField, submitButton };
   });
 
-  // ATUALIZADO: Usar seletores detectados como fallback
-  const selUser = loginConfig.selectors.username || autoDetectedSelectors.usernameField || 'input[type="email"], input[type="text"]';
-  const selPass = loginConfig.selectors.password || autoDetectedSelectors.passwordField || 'input[type="password"]';
-  const selSubmit = loginConfig.selectors.submit || autoDetectedSelectors.submitButton || 'button[type="submit"]';
+  // NOVO: resolver seletor/iframe de usuário e senha dinamicamente (prioriza .env, cai p/ fallback real)
+  await showStatus(page, 'Localizando campos de login...');
 
-  // Aguarda aparecerem os campos em qualquer frame (espera ativa, sem timeout do Puppeteer)
-  let userFrame = null, passFrame = null;
-  const startFind = Date.now();
-  while (Date.now() - startFind < 15000 && (!userFrame || !passFrame)) {
-    if (!userFrame && selUser) userFrame = await getFrameWithSelector(page, selUser);
-    if (!passFrame && selPass) passFrame = await getFrameWithSelector(page, selPass);
-    if (userFrame && passFrame) break;
-    await new Promise(r => setTimeout(r, 300));
+  const dedup = (arr) => Array.from(new Set(arr.filter(Boolean)));
+
+  const userCandidates = dedup([
+    loginConfig.selectors.username,
+    autoDetectedSelectors.usernameField,
+    '[name="email"]',
+    '#username',
+    '[name="username"]',
+    'input[id*="user"]',
+    'input[name*="user"]',
+    'input[id*="email"]',
+    'input[name*="email"]',
+    'input[type="email"]',
+    'input[type="text"]'
+  ]);
+
+  const passCandidates = dedup([
+    loginConfig.selectors.password,
+    autoDetectedSelectors.passwordField,
+    '#senha',
+    '[name="senha"]',
+    '#password',
+    '[name="password"]',
+    'input[type="password"]'
+  ]);
+
+  // NOVO: quando LOGIN_FIND_TIMEOUT=0, não esperar; apenas checar uma vez
+  const perTryUser = (LOGIN_FIND_TIMEOUT && LOGIN_FIND_TIMEOUT > 0) ? Math.max(300, Math.floor(LOGIN_FIND_TIMEOUT / Math.max(1, userCandidates.length))) : 0;
+  let selUser = null, userFrame = null;
+  for (const sel of userCandidates) {
+    const found = await waitForSelectorInAnyFrame(page, sel, perTryUser);
+    if (found.frame && found.handle) { selUser = sel; userFrame = found.frame; break; }
   }
-  // fallback para main frame se não achar
-  const mainFrame = page.mainFrame();
-  if (!userFrame) userFrame = mainFrame;
-  if (!passFrame) passFrame = mainFrame;
 
-  // Preenche os campos com digitação real + eventos
+  const perTryPass = (LOGIN_FIND_TIMEOUT && LOGIN_FIND_TIMEOUT > 0) ? Math.max(300, Math.floor(LOGIN_FIND_TIMEOUT / Math.max(1, passCandidates.length))) : 0;
+  let selPass = null, passFrame = null;
+  for (const sel of passCandidates) {
+    const found = await waitForSelectorInAnyFrame(page, sel, perTryPass);
+    if (found.frame && found.handle) { selPass = sel; passFrame = found.frame; break; }
+  }
+
+  const selSubmit = loginConfig.selectors.submit || autoDetectedSelectors.submitButton || 'button[type="submit"]';
+  const cleanSelSubmit = selSubmit.includes(':contains(') ? 'button[type="submit"]' : selSubmit;
+
+  // Preenche os campos com digitação real + eventos (robusto)
   await showStatus(page, 'Preenchendo e validando campos...');
-  const userOk = selUser ? await fillInputInFrame(userFrame, selUser, loginConfig.username) : true;
-  const passOk = selPass ? await fillInputInFrame(passFrame, selPass, loginConfig.password) : true;
+  let userOk = true, passOk = true;
 
-  // Se ainda não OK, tenta mais uma vez (alguns apps só aceitam após blur)
-  if (!userOk && selUser) await fillInputInFrame(userFrame, selUser, loginConfig.username);
-  if (!passOk && selPass) await fillInputInFrame(passFrame, selPass, loginConfig.password);
+  if (selUser && userFrame) {
+    userOk = await fillInputInFrame(userFrame, selUser, loginConfig.username);
+    if (!userOk) userOk = await fillInputInFrame(userFrame, selUser, loginConfig.username);
+  } else {
+    userOk = false;
+  }
+
+  if (selPass && passFrame) {
+    passOk = await fillInputInFrame(passFrame, selPass, loginConfig.password);
+    if (!passOk) passOk = await fillInputInFrame(passFrame, selPass, loginConfig.password);
+  } else {
+    passOk = false;
+  }
+
+  if (!selUser || !userOk) {
+    await showStatus(page, 'Falha ao preencher o e-mail/usuário.');
+    console.log(chalk.red(`Não foi possível localizar/preencher o campo de e-mail/usuário.`));
+    return false;
+  }
+  if (!selPass || !passOk) {
+    await showStatus(page, 'Falha ao preencher a senha.');
+    console.log(chalk.red(`Não foi possível localizar/preencher o campo de senha.`));
+    return false;
+  }
 
   await showStatus(page, 'Enviando credenciais...');
 
-  // Clique do submit: por seletor CSS ou por texto (em qualquer frame)
+  // NOVO: prioridade para Enter no campo de senha (mais rápido)
+  const tryPressEnter = async (frame, fieldSelector) => {
+    try {
+      const handle = await frame.$(fieldSelector);
+      if (!handle) return false;
+      await handle.press('Enter');
+      // blur rápido para disparar validações
+      await frame.$eval(fieldSelector, (input) => input.blur()).catch(() => {});
+      return true;
+    } catch { return false; }
+  };
+
+  // NOVO: enviar via form (requestSubmit) como segundo passo
+  const trySubmitViaForm = async (frame, fieldSelector) => {
+    try {
+      const ok = await frame.$eval(fieldSelector, (input) => {
+        const form = input.closest('form');
+        if (!form) return false;
+        if (typeof form.requestSubmit === 'function') form.requestSubmit();
+        else form.submit();
+        return true;
+      });
+      return !!ok;
+    } catch { return false; }
+  };
+
+  // Fallback: clique do submit
   const clickSubmitInFrame = async (frame) => {
     if (!frame) return false;
-    if (selSubmit && !selSubmit.includes(':contains(')) {
-      return frame.click(selSubmit).then(() => true).catch(() => false);
-    }
-    if (selSubmit && selSubmit.includes(':contains(')) {
+    if (selSubmit.includes(':contains(')) {
       const textMatch = selSubmit.match(/:contains\(['"]?(.*?)[\'"]?\)/i);
       const text = textMatch ? textMatch[1] : null;
       if (text) {
         const clicked = await clickButtonByTextInFrame(frame, text);
         if (clicked) return true;
       }
+    } else {
+      try { await frame.click(cleanSelSubmit); return true; } catch { /* ignore */ }
     }
     return false;
   };
 
-  let clicked = await clickSubmitInFrame(userFrame || passFrame);
-  if (!clicked) {
-    for (const frame of page.frames()) {
-      if (await clickSubmitInFrame(frame)) { clicked = true; break; }
-    }
-  }
-  if (!clicked && selPass && passFrame) {
-    const handle = await passFrame.$(selPass);
-    if (handle) {
-      // Pressiona Enter no campo de senha como fallback e força blur depois
-      await handle.press('Enter').catch(() => {});
-      await passFrame.$eval(selPass, (input) => input.blur()).catch(() => {});
+  // Ordem: Enter -> requestSubmit -> clique
+  let submitted = false;
+  if (selPass && passFrame) submitted = await tryPressEnter(passFrame, selPass);
+  if (!submitted && selPass && passFrame) submitted = await trySubmitViaForm(passFrame, selPass);
+  if (!submitted && selUser && userFrame) submitted = await trySubmitViaForm(userFrame, selUser);
+  if (!submitted) {
+    submitted = await clickSubmitInFrame(userFrame || passFrame);
+    if (!submitted) {
+      for (const frame of page.frames()) {
+        if (await clickSubmitInFrame(frame)) { submitted = true; break; }
+      }
     }
   }
 
-  await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
+  // NOVO: espera curta pós-submit (evita networkidle2 demorado)
+  const quickPostSubmitWait = async () => {
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 3000 }).catch(() => {}),
+      page.waitForSelector('fuse-vertical-navigation', { timeout: 3000 }).catch(() => {}),
+      new Promise(r => setTimeout(r, 600))
+    ]);
+  };
+  await quickPostSubmitWait();
 
-  // Verificação de rota esperada (espera ativa)
+  // Verificação rápida de sucesso (rota OU shell da app OU sumiço do formulário)
   const targetPath = expectedPath;
+  const maxWaitMs = (LOGIN_CONFIRM_TIMEOUT && LOGIN_CONFIRM_TIMEOUT > 0) ? LOGIN_CONFIRM_TIMEOUT : 3000; // rápido por padrão
   const start = Date.now();
-  const maxWaitMs = 20000;
   while ((Date.now() - start) < maxWaitMs) {
     try {
       const urlObj = new URL(page.url());
-      if (urlObj.pathname === targetPath || urlObj.pathname.endsWith(targetPath)) {
+      const pathOk = urlObj.pathname === targetPath || urlObj.pathname.endsWith(targetPath);
+      const markers = await page.evaluate((uSel, pSel) => {
+        const inApp = !!document.querySelector('fuse-vertical-navigation');
+        const userEl = uSel ? document.querySelector(uSel) : null;
+        const passEl = pSel ? document.querySelector(pSel) : null;
+        return { inApp, hasLogin: !!(userEl || passEl) };
+      }, selUser, selPass);
+      if (pathOk || (markers.inApp && !markers.hasLogin)) {
         await showStatus(page, 'Login realizado com sucesso.');
-        console.log(chalk.green('Login realizado com sucesso, rota esperada encontrada:'), urlObj.pathname);
+        console.log(chalk.green('Login confirmado rapidamente.'));
         return true;
       }
     } catch { /* ignore */ }
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 150));
   }
 
   await showStatus(page, 'Não foi possível confirmar login.');
-  console.log(chalk.yellow('Aviso: não foi possível confirmar que a rota esperada foi atingida após o login.'));
+  console.log(chalk.yellow('Aviso: rota esperada não confirmada no tempo reduzido.'));
   return false;
 }
 
@@ -370,15 +524,15 @@ export async function clearElementHighlight(page, selector) {
   } catch {}
 }
 
-// NOVO: flag para habilitar/desabilitar screenshots (ENV: ENABLE_SCREENSHOTS=0|false para desabilitar)
+// NOVO: flag para habilitar/desabilitar screenshots (ENV: ENABLE_SCREENSHOTS=0|false)
 export const ENABLE_SCREENSHOTS = (() => {
   const v = process.env.ENABLE_SCREENSHOTS;
   if (v == null) return true;
-  return !(v.toLowerCase() === '0' || v.toLowerCase() === 'false');
+  return !(String(v).toLowerCase() === '0' || String(v).toLowerCase() === 'false');
 })();
 
+// NOVO: utilitário de screenshot (elemento)
 export async function takeScreenshot(page, selector, fileName) {
-  // NOVO: respeita a flag
   if (!ENABLE_SCREENSHOTS) {
     console.log('  Captura de tela desabilitada por flag (ENABLE_SCREENSHOTS).');
     return;
@@ -386,6 +540,7 @@ export async function takeScreenshot(page, selector, fileName) {
   try {
     const elementHandle = await page.$(selector);
     if (elementHandle) {
+      if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
       const screenshotPath = path.join(SCREENSHOT_DIR, fileName);
       await elementHandle.screenshot({ path: screenshotPath });
       console.log(`  ${chalk.gray('Screenshot salvo em:')} ${screenshotPath}`);
@@ -397,72 +552,77 @@ export async function takeScreenshot(page, selector, fileName) {
   }
 }
 
-// Prepara o browser e page, adiciona listeners de rede, cria pasta de screenshots.
-// Retorna { browser, page, requestErrors } já com a navegação para a URL feita.
+// NOVO: prepara browser/page, listeners e login
 export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = null) {
   if (!fs.existsSync(SCREENSHOT_DIR)) {
-    fs.mkdirSync(SCREENSHOT_DIR);
+    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
   }
-  // REMOVIDO: não apagar mais os arquivos existentes
-  // else {
-  //   fs.readdirSync(SCREENSHOT_DIR).forEach(file => fs.unlinkSync(path.join(SCREENSHOT_DIR, file)));
-  // }
 
-  // NOVO: ler opções do Puppeteer do .env
+  // Opções do Puppeteer do .env
   const ENV_HEADLESS = toBool(process.env.HEADLESS, false);
   const ENV_SLOWMO = toNum(process.env.SLOWMO, 50);
   const ENV_MAXIMIZE = toBool(process.env.MAXIMIZE, true);
   const ENV_VIEWPORT_W = toNum(process.env.VIEWPORT_WIDTH, 1920);
   const ENV_VIEWPORT_H = toNum(process.env.VIEWPORT_HEIGHT, 1080);
 
+  // NOVO: args e viewport específicos para headless
+  const args = [
+    ...(launchOptions.args || []),
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-gpu',
+  ];
+  if (ENV_HEADLESS || !ENV_MAXIMIZE) {
+    args.push(`--window-size=${ENV_VIEWPORT_W},${ENV_VIEWPORT_H}`);
+  } else {
+    args.push('--start-maximized');
+  }
+
   const browser = await puppeteer.launch({
     headless: ENV_HEADLESS,
-    defaultViewport: ENV_MAXIMIZE ? null : { width: ENV_VIEWPORT_W, height: ENV_VIEWPORT_H },
+    defaultViewport: ENV_HEADLESS
+      ? { width: ENV_VIEWPORT_W, height: ENV_VIEWPORT_H }   // headless: força viewport grande
+      : (ENV_MAXIMIZE ? null : { width: ENV_VIEWPORT_W, height: ENV_VIEWPORT_H }),
     slowMo: ENV_SLOWMO,
     ...launchOptions,
-    args: [
-      ...(launchOptions.args || []),
-      ...(ENV_MAXIMIZE ? ['--start-maximized'] : [])
-    ]
+    args
   });
   const page = await browser.newPage();
 
-  // Ajusta viewport somente se não maximizado
-  if (!ENV_MAXIMIZE) {
+  // NOVO: user-agent real para evitar bloqueios no headless
+  try {
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36'
+    );
+  } catch {}
+
+  if (!ENV_HEADLESS && !ENV_MAXIMIZE) {
     await page.setViewport({ width: ENV_VIEWPORT_W, height: ENV_VIEWPORT_H });
   }
 
-  // NOVO: desabilitar timeouts globais
+  // Desabilitar timeouts globais
   page.setDefaultTimeout(0);
   page.setDefaultNavigationTimeout(0);
 
-  // NOVO: repassar console do navegador
+  // Espelhar console do browser
   page.on('console', msg => {
-    try {
-      console.log(`[browser] ${msg.text()}`);
-    } catch {
-      // ignora
-    }
+    try { console.log(`[browser] ${msg.text()}`); } catch {}
   });
 
   const requestErrors = [];
 
   page.on('response', response => {
-    if (!response.ok()) {
-      requestErrors.push({
-        type: 'HTTP Error',
-        status: response.status(),
-        url: response.url(),
-      });
-    }
+    try {
+      if (!response.ok()) {
+        requestErrors.push({ type: 'HTTP Error', status: response.status(), url: response.url() });
+      }
+    } catch {}
   });
 
   page.on('requestfailed', request => {
-    requestErrors.push({
-      type: 'Network Failure',
-      url: request.url(),
-      error: request.failure() ? request.failure().errorText : 'unknown',
-    });
+    try {
+      requestErrors.push({ type: 'Network Failure', url: request.url(), error: request.failure() ? request.failure().errorText : 'unknown' });
+    } catch {}
   });
 
   try {
@@ -480,7 +640,7 @@ export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = 
   return { browser, page, requestErrors };
 }
 
-// NOVO: carregador unificado de links (TS/JS/JSON) com parser robusto do .ts
+// NOVO: carregador unificado de links (TS/JS/JSON)
 export async function loadLinksMap() {
   const tsPath = path.join(__dirname, 'links_map.ts');
   const jsPath = path.join(__dirname, 'links_map.js');
@@ -503,6 +663,7 @@ export async function loadLinksMap() {
       if (!fs.existsSync(absPath)) return null;
       const src = fs.readFileSync(absPath, 'utf8');
 
+      // Extrai o primeiro array literal do arquivo (tolerante a comentários)
       const extractArrayLiteral = (code) => {
         let startSearch = code.indexOf('linksMap');
         if (startSearch < 0) startSearch = 0;
@@ -522,10 +683,6 @@ export async function loadLinksMap() {
 
           if (ch === '/' && nx === '/') { inLC = true; i++; continue; }
           if (ch === '/' && nx === '*') { inBC = true; i++; continue; }
-
-          if (ch === '\'') { inS = true; esc = false; continue; }
-          if (ch === '"') { inD = true; esc = false; continue; }
-          if (ch === '`') { inT = true; esc = false; continue; }
 
           if (ch === '[') { if (depth === 0) start = i; depth++; continue; }
           if (ch === ']') { depth--; if (depth === 0) { end = i; break; } continue; }
@@ -565,6 +722,7 @@ export async function loadLinksMap() {
       if (!arrayRaw) return null;
 
       let jsonLike = stripCommentsPreserveStrings(arrayRaw);
+      // remove vírgula antes de } ou ] (trailing commas)
       jsonLike = jsonLike.replace(/,\s*(?=[}\]])/g, '');
 
       const linksArr = JSON.parse(jsonLike);
