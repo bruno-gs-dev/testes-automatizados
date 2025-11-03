@@ -37,27 +37,73 @@ export async function discoverLinks(page) {
     await page.waitForSelector('fuse-vertical-navigation', { timeout: 10000 });
     await new Promise(r => setTimeout(r, 1000)); // Aguardar animações
     
-    // Buscar todos os itens de navegação principais
-    const mainNavItems = await page.$$('fuse-vertical-navigation-aside-item');
-    console.log(chalk.gray(`Encontrados ${mainNavItems.length} itens de navegação principais`));
+    // PRIMEIRO: Coletar TODOS os links diretos que já estão visíveis no menu principal
+    console.log(chalk.cyan('📋 FASE 1: Coletando links diretos do menu principal...'));
+    const initialDirectLinks = await page.evaluate(() => {
+      const navigation = document.querySelector('fuse-vertical-navigation');
+      if (!navigation) return [];
+      
+      const links = [];
+      // CORRIGIDO: Buscar TODOS os tipos de itens de navegação com links diretos
+      const allNavigationItems = [
+        ...navigation.querySelectorAll('fuse-vertical-navigation-aside-item a'),
+        ...navigation.querySelectorAll('fuse-vertical-navigation-basic-item a'),
+        ...navigation.querySelectorAll('fuse-vertical-navigation-collapsable-item a'),
+        ...navigation.querySelectorAll('fuse-vertical-navigation-group-item a')
+      ];
+      
+      allNavigationItems.forEach(a => {
+        const text = (a.innerText || a.textContent || '').trim();
+        const href = a.href;
+        
+        if (href && 
+            href !== '#' && 
+            href !== '' && 
+            href !== 'javascript:void(0)' && 
+            href.startsWith(window.location.origin) && 
+            text && 
+            text.length > 0) {
+          links.push({ text, href });
+        }
+      });
+      
+      // NOVO: Remover duplicatas baseado no href
+      const uniqueLinks = [];
+      const seenHrefs = new Set();
+      links.forEach(link => {
+        if (!seenHrefs.has(link.href)) {
+          seenHrefs.add(link.href);
+          uniqueLinks.push(link);
+        }
+      });
+      
+      return uniqueLinks;
+    });
+    
+    console.log(chalk.green(`✓ Encontrados ${initialDirectLinks.length} links diretos no menu principal:`));
+    initialDirectLinks.forEach(link => {
+      discoveredLinks.set(link.href, link);
+      console.log(chalk.green(`  [+] ${link.text}`));
+    });
+    
+    // SEGUNDO: Buscar todos os itens de navegação principais para expandir
+    console.log(chalk.cyan('\n📋 FASE 2: Explorando itens expansíveis...'));
+    // CORRIGIDO: Buscar TODOS os tipos de itens que podem ter submenus
+    const mainNavItems = await page.$$('fuse-vertical-navigation-aside-item, fuse-vertical-navigation-collapsable-item, fuse-vertical-navigation-group-item');
+    console.log(chalk.gray(`Encontrados ${mainNavItems.length} itens de navegação para analisar`));
     
     for (let i = 0; i < mainNavItems.length; i++) {
       const item = mainNavItems[i];
       
       try {
-        // Verificar se o item tem link direto
-        const directLink = await item.evaluate(el => {
+        // Verificar se já tem link direto (que já foi coletado na FASE 1)
+        const hasDirectLink = await item.evaluate(el => {
           const anchor = el.querySelector('a');
-          if (anchor && anchor.href && anchor.href.startsWith(window.location.origin) && !anchor.href.endsWith('#')) {
-            const text = (anchor.innerText || anchor.textContent || '').trim();
-            return { text, href: anchor.href };
-          }
-          return null;
+          return !!(anchor && anchor.href && anchor.href.startsWith(window.location.origin) && !anchor.href.endsWith('#'));
         });
         
-        if (directLink) {
-          console.log(chalk.cyan(`  [+] Link direto: ${directLink.text}`));
-          discoveredLinks.set(directLink.href, directLink);
+        if (hasDirectLink) {
+          // Pula itens que já têm link direto (já foram coletados)
           continue;
         }
         
@@ -251,7 +297,7 @@ export async function discoverLinks(page) {
   // Converter Map para Array
   const uniqueLinks = Array.from(discoveredLinks.values());
   
-  console.log(chalk.green(`✓ Encontrados ${uniqueLinks.length} links/rotas únicos (incluindo submenus)`));
+  console.log(chalk.green(`✓ Encontrados ${uniqueLinks.length} links/rotas únicos (incluindo links diretos e submenus)`));
   
   uniqueLinks.forEach((link, index) => {
     console.log(chalk.cyan(`  ${index + 1}. ${link.text}`), chalk.gray(`(${link.href})`));
