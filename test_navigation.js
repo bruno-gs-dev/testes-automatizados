@@ -14,153 +14,268 @@ import { fileURLToPath } from 'url';
 export async function discoverLinks(page) {
   await showStatus(page, 'Mapeando: Iniciando descoberta de links...');
   
+  // NOVO: Verificar se está em página válida antes de continuar
+  const currentUrl = page.url();
+  if (currentUrl.includes('/sessao/expirada') || currentUrl.includes('/login')) {
+    throw new Error(`Página não válida para descoberta de links: ${currentUrl}. Verifique se o login foi bem-sucedido.`);
+  }
+  
   // NOVO: Detectar tipo de aplicação e usar seletores apropriados
   const appType = await detectApplicationType(page);
   const selectors = getCustomSelectors();
   
-  console.log(chalk.gray(`Usando configuração de navegação: ${appType}`));
-  console.log(chalk.gray(`Seletores: ${JSON.stringify(selectors, null, 2)}`));
+  console.log(chalk.gray(`Tipo de aplicação detectado: ${appType}`));
+  console.log(chalk.gray(`Usando seletores: ${JSON.stringify(selectors, null, 2)}`));
   
-  const mainPanelSelector = selectors.mainPanel;
-  const mainPanelItemsSelector = selectors.mainItems;
-  const asideWrapperSelector = selectors.asideWrapper;
-  const finalLinkSelector = `${asideWrapperSelector} ${selectors.finalLink}`;
-  
-  /**
-   * Esta função procura repetidamente por submenus fechados (collapsable-item)
-   * e clica neles até que não haja mais nada para expandir.
-   */
-  async function expandAllSubMenus(page, wrapperSelector) {
-    const collapsableSelector = `${wrapperSelector} ${selectors.collapsable}`;
-    
-    // O seletor-chave: Procura o *alvo clicável* (<a> ou <div><div>)
-    // DENTRO de um item que tenha a classe de "colapsado".
-    const collapsableItemSelector = `
-      ${collapsableSelector}.fuse-vertical-navigation-item-collapsed > a,
-      ${collapsableSelector}.fuse-vertical-navigation-item-collapsed > div > div
-    `;
-
-    let closedSubMenus = await page.$$(collapsableItemSelector);
-    let iterations = 0; // Prevenção de loop infinito
-    
-    while (closedSubMenus.length > 0 && iterations < 10) {
-      console.log(chalk.gray(`    Expandindo ${closedSubMenus.length} submenus encontrados...`));
-      
-      for (const handle of closedSubMenus) {
-        try {
-          // Usa o clique nativo do browser, que é mais confiável
-          await handle.evaluate(el => el.click());
-          await new Promise(r => setTimeout(r, 300)); // Espera a animação
-        } catch (e) {
-          // Ignora se o elemento sumir após o clique
-        }
-      }
-      
-      iterations++;
-      // Procura novamente para ver se novos submenus apareceram
-      closedSubMenus = await page.$$(collapsableItemSelector);
-    }
-  }
-
-
-  // NOVO: Busca mais genérica por itens de navegação
-  const mainNavHandles = await page.$$(mainPanelItemsSelector);
   const discoveredLinks = new Map();
-
-  console.log(chalk.gray(`Encontrados ${mainNavHandles.length} itens no menu principal. Iterando...`));
-
-  for (const handle of mainNavHandles) {
-    const itemInfo = await handle.evaluate((el, clickSelector) => {
-      const tagName = el.tagName.toLowerCase();
-      const span = el.querySelector('span') || el.querySelector('.text') || el;
-      const text = span ? span.innerText.trim() : (el.innerText || '').trim();
-      let href = null;
-      
-      // Busca por link direto
-      const anchor = el.querySelector('a') || (el.tagName === 'A' ? el : null);
-      if (anchor && anchor.href && anchor.href.startsWith(window.location.origin) && !anchor.href.endsWith('#')) {
-        href = anchor.href;
-      }
-      
-      // Verifica se é clicável (categoria)
-      const isClickable = el.querySelector(clickSelector) || el.matches(clickSelector);
-      
-      return { tagName, text, href, isClickable };
-    }, selectors.clickTarget);
-
-    if (itemInfo.href) {
-      // É um link direto
-      console.log(chalk.cyan(`  [+] Link direto encontrado:`), itemInfo.text); 
-      if (!discoveredLinks.has(itemInfo.href)) {
-        discoveredLinks.set(itemInfo.href, { text: itemInfo.text, href: itemInfo.href });
-      }
-    } else if (itemInfo.isClickable) {
-      // É uma categoria clicável
-      console.log(chalk.blueBright(`  [*] Clicando categoria:`), itemInfo.text); 
-      await showStatus(page, `Mapeando: ${itemInfo.text}...`);
+  
+  // NOVO: Lógica específica para Angular Fuse com detecção de submenus aninhados
+  if (appType === 'angular_fuse') {
+    console.log(chalk.blue('Detectado Angular Fuse - usando lógica específica de navegação'));
+    
+    // Aguardar o componente Fuse estar completamente carregado
+    await page.waitForSelector('fuse-vertical-navigation', { timeout: 10000 });
+    await new Promise(r => setTimeout(r, 1000)); // Aguardar animações
+    
+    // Buscar todos os itens de navegação principais
+    const mainNavItems = await page.$$('fuse-vertical-navigation-aside-item');
+    console.log(chalk.gray(`Encontrados ${mainNavItems.length} itens de navegação principais`));
+    
+    for (let i = 0; i < mainNavItems.length; i++) {
+      const item = mainNavItems[i];
       
       try {
-        const clicked = await handle.evaluate((el, clickSelector) => {
-          const target = el.querySelector(clickSelector) || el;
-          if (target && typeof target.click === 'function') {
-            target.click();
-            return true;
+        // Verificar se o item tem link direto
+        const directLink = await item.evaluate(el => {
+          const anchor = el.querySelector('a');
+          if (anchor && anchor.href && anchor.href.startsWith(window.location.origin) && !anchor.href.endsWith('#')) {
+            const text = (anchor.innerText || anchor.textContent || '').trim();
+            return { text, href: anchor.href };
           }
-          return false;
-        }, selectors.clickTarget);
-
-        if (!clicked) throw new Error('Elemento clicável não foi encontrado.');
+          return null;
+        });
         
-        await new Promise(r => setTimeout(r, 750));
-
-        await expandAllSubMenus(page, asideWrapperSelector);
+        if (directLink) {
+          console.log(chalk.cyan(`  [+] Link direto: ${directLink.text}`));
+          discoveredLinks.set(directLink.href, directLink);
+          continue;
+        }
         
-        const finalLinks = await page.evaluate((selector) => {
-          const links = [];
-          document.querySelectorAll(selector).forEach(a => {
-            const span = a.querySelector('span') || a.querySelector('.text') || a;
-            const text = span ? span.innerText.trim() : a.innerText.trim();
-            if (a.href && a.href.startsWith(window.location.origin) && !a.href.endsWith('#')) {
-              links.push({ text, href: a.href });
+        // Verificar se é um item clicável (categoria)
+        const itemInfo = await item.evaluate(el => {
+          const clickableDiv = el.querySelector('div > div'); // Seletor específico do Fuse
+          const text = (el.innerText || el.textContent || '').trim().split('\n')[0]; // Pega só a primeira linha
+          
+          if (clickableDiv && text && text.length > 0) {
+            return { text, isClickable: true };
+          }
+          return null;
+        });
+        
+        if (itemInfo && itemInfo.isClickable) {
+          console.log(chalk.blue(`  [*] Expandindo categoria: ${itemInfo.text}`));
+          
+          // Clicar no item para expandir
+          await item.evaluate(el => {
+            const clickTarget = el.querySelector('div > div');
+            if (clickTarget) {
+              clickTarget.click();
             }
           });
-          return links;
-        }, finalLinkSelector);
-
-        console.log(chalk.gray(`    Encontrados ${finalLinks.length} links em "${itemInfo.text}".`));
-        finalLinks.forEach(link => {
-          if (!discoveredLinks.has(link.href)) {
-            discoveredLinks.set(link.href, link);
+          
+          // Aguardar a expansão
+          await new Promise(r => setTimeout(r, 750));
+          
+          // NOVO: Buscar pelo wrapper de links que aparece
+          const asideWrapper = await page.$('.fuse-vertical-navigation-aside-wrapper');
+          if (asideWrapper) {
+            console.log(chalk.gray(`    Wrapper encontrado, analisando conteúdo...`));
+            
+            // NOVO: PRIMEIRO coletar TODOS os links diretos do wrapper (incluindo os que estão dentro de aside-item)
+            const allDirectLinksInWrapper = await page.evaluate(() => {
+              const wrapper = document.querySelector('.fuse-vertical-navigation-aside-wrapper');
+              if (!wrapper) return [];
+              
+              const links = [];
+              // MUDANÇA: Buscar TODOS os links <a> do wrapper, independente de onde estão
+              wrapper.querySelectorAll('a').forEach(a => {
+                const text = (a.innerText || a.textContent || '').trim();
+                const href = a.href;
+                
+                if (href && 
+                    href !== '#' && 
+                    href !== '' && 
+                    href !== 'javascript:void(0)' && 
+                    href.startsWith(window.location.origin) && 
+                    text && 
+                    text.length > 0) {
+                  links.push({ text, href });
+                }
+              });
+              return links;
+            });
+            
+            // Filtrar apenas os links que ainda não foram descobertos
+            const newDirectLinks = allDirectLinksInWrapper.filter(link => !discoveredLinks.has(link.href));
+            
+            if (newDirectLinks.length > 0) {
+              console.log(chalk.green(`      ✓ Encontrados ${newDirectLinks.length} links diretos na categoria "${itemInfo.text}"`));
+              newDirectLinks.forEach(link => {
+                discoveredLinks.set(link.href, link);
+                console.log(chalk.green(`        ➤ ${link.text}`));
+              });
+            }
+            
+            // NOVO: DEPOIS explorar itens colapsáveis para encontrar mais links
+            const collapsableItems = await page.$$('.fuse-vertical-navigation-aside-wrapper fuse-vertical-navigation-collapsable-item');
+            
+            if (collapsableItems.length > 0) {
+              console.log(chalk.magenta(`      Encontrados ${collapsableItems.length} itens colapsáveis para explorar...`));
+              
+              for (let k = 0; k < collapsableItems.length; k++) {
+                const collapsableItem = collapsableItems[k];
+                
+                try {
+                  // Verificar se o item colapsável é expandível
+                  const collapsableItemInfo = await collapsableItem.evaluate(el => {
+                    const clickableDiv = el.querySelector('div > div');
+                    const text = (el.innerText || el.textContent || '').trim().split('\n')[0];
+                    
+                    if (clickableDiv && text && text.length > 0) {
+                      return { text, isClickable: true };
+                    }
+                    return null;
+                  });
+                  
+                  if (collapsableItemInfo && collapsableItemInfo.isClickable) {
+                    console.log(chalk.blue(`        [*] Expandindo item colapsável: ${collapsableItemInfo.text}`));
+                    
+                    // Clicar no item colapsável
+                    await collapsableItem.evaluate(el => {
+                      const clickTarget = el.querySelector('div > div');
+                      if (clickTarget) {
+                        clickTarget.click();
+                      }
+                    });
+                    
+                    // Aguardar expansão do item colapsável
+                    await new Promise(r => setTimeout(r, 750));
+                    
+                    // NOVO: Coletar todos os links que aparecem após expandir o item colapsável
+                    const collapsableLinks = await page.evaluate(() => {
+                      const wrapper = document.querySelector('.fuse-vertical-navigation-aside-wrapper');
+                      if (!wrapper) return [];
+                      
+                      const links = [];
+                      wrapper.querySelectorAll('a').forEach(a => {
+                        const text = (a.innerText || a.textContent || '').trim();
+                        const href = a.href;
+                        
+                        if (href && 
+                            href !== '#' && 
+                            href !== '' && 
+                            href !== 'javascript:void(0)' && 
+                            href.startsWith(window.location.origin) && 
+                            text && 
+                            text.length > 0) {
+                          links.push({ text, href });
+                        }
+                      });
+                      return links;
+                    });
+                    
+                    // Filtrar apenas os novos links que ainda não foram descobertos
+                    const newCollapsableLinks = collapsableLinks.filter(link => !discoveredLinks.has(link.href));
+                    
+                    if (newCollapsableLinks.length > 0) {
+                      console.log(chalk.green(`          ➤ ${newCollapsableLinks.length} novos links encontrados no item colapsável "${collapsableItemInfo.text}"`));
+                      newCollapsableLinks.forEach(link => {
+                        discoveredLinks.set(link.href, link);
+                        console.log(chalk.green(`            ✓ ${link.text}`));
+                      });
+                    }
+                  }
+                  
+                } catch (e) {
+                  console.log(chalk.yellow(`        ⚠ Erro ao processar item colapsável ${k + 1}: ${e.message}`));
+                }
+              }
+            }
+            
+            // Fechar o menu clicando fora
+            await page.click('body', { offset: { x: 10, y: 10 } });
+            await new Promise(r => setTimeout(r, 500));
           }
-        });
-
+        }
+        
       } catch (e) {
-        console.log(chalk.yellow(`    Aviso: falha ao processar a categoria "${itemInfo.text}".`), e.message.split('\n')[0]);
+        console.log(chalk.yellow(`  ⚠ Erro ao processar item ${i + 1}: ${e.message}`));
       }
     }
+    
+  } else {
+    // Lógica genérica para outros tipos de aplicação
+    console.log(chalk.blue('Usando lógica genérica de navegação'));
+    
+    const allLinks = await page.evaluate(() => {
+      const links = [];
+      document.querySelectorAll('a[href]').forEach(a => {
+        try {
+          const text = (a.innerText || a.textContent || '').trim();
+          const href = a.href;
+          
+          if (href && 
+              href !== '#' && 
+              href !== '' && 
+              href !== 'javascript:void(0)' && 
+              href.startsWith(window.location.origin) && 
+              text && 
+              text.length > 0 && 
+              text.toLowerCase() !== 'sair') {
+            links.push({ text, href });
+          }
+        } catch (e) {
+          // Ignora elementos problemáticos
+        }
+      });
+      return links;
+    });
+    
+    allLinks.forEach(link => {
+      if (!discoveredLinks.has(link.href)) {
+        discoveredLinks.set(link.href, link);
+      }
+    });
   }
-
-  const result = Array.from(discoveredLinks.values());
+  
+  // Converter Map para Array
+  const uniqueLinks = Array.from(discoveredLinks.values());
+  
+  console.log(chalk.green(`✓ Encontrados ${uniqueLinks.length} links/rotas únicos (incluindo submenus)`));
+  
+  uniqueLinks.forEach((link, index) => {
+    console.log(chalk.cyan(`  ${index + 1}. ${link.text}`), chalk.gray(`(${link.href})`));
+  });
 
   // SALVA JSON COM LINKS PARA USO PELOS OUTROS TESTES
   try {
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
     const linksFile = path.join(__dirname, 'links_map.json');
-    fs.writeFileSync(linksFile, JSON.stringify(result, null, 2), 'utf8');
+    fs.writeFileSync(linksFile, JSON.stringify(uniqueLinks, null, 2), 'utf8');
     console.log(chalk.gray(`Links de navegação salvos em: ${linksFile}`));
   } catch (e) {
     console.log(chalk.yellow('Aviso: falha ao salvar links_map.json:'), e.message.split('\n')[0]);
   }
 
-  return result;
+  return uniqueLinks;
 }
 
 
 /**
  * Executa um teste de "map & click" (O TESTE DE NAVEGAÇÃO NORMAL)
  */
-export default async function runNavigationTest() {
+export default async function runNavigationTest(onlyDiscover = false) {
   console.log(chalk.blue(`Executando teste de NAVEGAÇÃO (Map & Click) para: ${URL_ALVO}\n`));
   let browser;
   try {
@@ -183,6 +298,11 @@ export default async function runNavigationTest() {
       console.log(`  - ${chalk.cyan(link.text)} ${chalk.gray(`(${link.href})`)}`);
     });
     
+    // NOVO: Se onlyDiscover for true, para aqui
+    if (onlyDiscover) {
+      console.log(chalk.blue.bold('\n✅ Descoberta de links concluída. Testes de navegação não executados.'));
+      return { totalErros: 0, linksTestados: 0, linksEncontrados: discoveredLinks.length };
+    }
     
     // --- PARTE B: TESTE DE NAVEGAÇÃO (1 a 1) ---
     console.log(chalk.bold('\n--- Iniciando Teste de Navegação (Acessando 1 a 1) ---'));

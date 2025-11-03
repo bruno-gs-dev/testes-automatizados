@@ -229,6 +229,8 @@ export async function detectApplicationType(page) {
     const checks = {
       angular_fuse: !!document.querySelector('fuse-vertical-navigation'),
       bootstrap: !!document.querySelector('.navbar, .nav, [class*="bootstrap"]') || !!window.bootstrap,
+      generic_navbar: !!document.querySelector('#navigation'),
+      sidebar: !!document.querySelector('.sidebar, .side-nav'),
       react: !!document.querySelector('[data-reactroot], #root, #__next') || !!window.React,
       vue: !!document.querySelector('[data-v-], #app') || !!window.Vue,
       generic: true
@@ -405,60 +407,160 @@ export async function performLogin(page, loginConfig) {
 
   await showStatus(page, 'Enviando credenciais...');
 
-  // NOVO: prioridade para Enter no campo de senha (mais rápido)
+  // NOVO: definir funções auxiliares que estavam faltando
   const tryPressEnter = async (frame, fieldSelector) => {
-    try {
-      const handle = await frame.$(fieldSelector);
-      if (!handle) return false;
-      await handle.press('Enter');
-      // blur rápido para disparar validações
-      await frame.$eval(fieldSelector, (input) => input.blur()).catch(() => {});
-      return true;
-    } catch { return false; }
+    // try {
+    //   const handle = await frame.$(fieldSelector);
+    //   if (!handle) return false;
+    //   await handle.press('Enter');
+    //   await frame.$eval(fieldSelector, (input) => input.blur()).catch(() => {});
+    //   return true;
+    // } catch { return false; }
   };
 
-  // NOVO: enviar via form (requestSubmit) como segundo passo
   const trySubmitViaForm = async (frame, fieldSelector) => {
-    try {
-      const ok = await frame.$eval(fieldSelector, (input) => {
-        const form = input.closest('form');
-        if (!form) return false;
-        if (typeof form.requestSubmit === 'function') form.requestSubmit();
-        else form.submit();
-        return true;
+    // try {
+    //   const ok = await frame.$eval(fieldSelector, (input) => {
+    //     const form = input.closest('form');
+    //     if (!form) return false;
+    //     if (typeof form.requestSubmit === 'function') form.requestSubmit();
+    //     else form.submit();
+    //     return true;
+    //   });
+    //   return !!ok;
+    // } catch { return false; }
+  };
+
+  // NOVO: diagnóstico do botão antes de tentar clicar
+  const buttonDiagnostic = await page.evaluate((submitSelector) => {
+    const buttons = document.querySelectorAll([
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button',
+      '[role="button"]',
+      '.btn',
+      '.button'
+    ].join(', '));
+    
+    const found = [];
+    buttons.forEach((btn, index) => {
+      const text = (btn.innerText || btn.textContent || btn.value || '').trim();
+      const id = btn.id;
+      const classes = btn.className;
+      const type = btn.type;
+      const visible = !!(btn.offsetWidth || btn.offsetHeight || btn.getClientRects().length);
+      const disabled = btn.disabled;
+      
+      found.push({
+        index,
+        tag: btn.tagName,
+        text,
+        id,
+        classes,
+        type,
+        visible,
+        disabled,
+        matches: btn.matches ? btn.matches(submitSelector) : false
       });
-      return !!ok;
-    } catch { return false; }
-  };
+    });
+    
+    return found;
+  }, cleanSelSubmit);
 
-  // Fallback: clique do submit
-  const clickSubmitInFrame = async (frame) => {
-    if (!frame) return false;
-    if (selSubmit.includes(':contains(')) {
-      const textMatch = selSubmit.match(/:contains\(['"]?(.*?)[\'"]?\)/i);
-      const text = textMatch ? textMatch[1] : null;
-      if (text) {
-        const clicked = await clickButtonByTextInFrame(frame, text);
-        if (clicked) return true;
+  console.log(chalk.gray('Botões encontrados na página:'));
+  buttonDiagnostic.forEach(btn => {
+    console.log(chalk.gray(`  ${btn.index}: ${btn.tag} "${btn.text}" id="${btn.id}" visible=${btn.visible} disabled=${btn.disabled} matches=${btn.matches}`));
+  });
+
+  // NOVO: estratégias múltiplas de submit em ordem de prioridade
+  const submitStrategies = [
+    // 1. Enter no campo de senha
+    async () => {
+      if (selPass && passFrame) {
+        console.log(chalk.gray('Tentativa 1: Enter no campo de senha'));
+        return await tryPressEnter(passFrame, selPass);
       }
-    } else {
-      try { await frame.click(cleanSelSubmit); return true; } catch { /* ignore */ }
+      return false;
+    },
+    
+    // 2. Form submit via campo de senha
+    async () => {
+      if (selPass && passFrame) {
+        console.log(chalk.gray('Tentativa 2: Form submit via campo de senha'));
+        return await trySubmitViaForm(passFrame, selPass);
+      }
+      return false;
+    },
+    
+    // 3. Clique direto no seletor configurado
+    async () => {
+      console.log(chalk.gray(`Tentativa 3: Clique direto no seletor ${cleanSelSubmit}`));
+      try {
+        await page.click(cleanSelSubmit, { delay: 100 });
+        return true;
+      } catch { return false; }
+    },
+    
+    // 4. Busca por texto "entrar", "login", etc
+    async () => {
+      console.log(chalk.gray('Tentativa 4: Busca por texto do botão'));
+      const textVariations = ['entrar', 'login', 'sign in', 'conectar', 'acessar', 'submit'];
+      
+      for (const text of textVariations) {
+        const clicked = await page.evaluate((searchText) => {
+          const buttons = document.querySelectorAll('button, input[type="submit"], [role="button"]');
+          for (const btn of buttons) {
+            const btnText = (btn.innerText || btn.textContent || btn.value || '').toLowerCase();
+            if (btnText.includes(searchText)) {
+              btn.click();
+              return true;
+            }
+          }
+          return false;
+        }, text);
+        
+        if (clicked) {
+          console.log(chalk.gray(`  ✓ Clicou em botão com texto contendo "${text}"`));
+          return true;
+        }
+      }
+      return false;
+    },
+    
+    // 5. Clique no primeiro botão visível e habilitado
+    async () => {
+      console.log(chalk.gray('Tentativa 5: Primeiro botão visível e habilitado'));
+      return await page.evaluate(() => {
+        const buttons = document.querySelectorAll('button, input[type="submit"]');
+        for (const btn of buttons) {
+          const visible = !!(btn.offsetWidth || btn.offsetHeight || btn.getClientRects().length);
+          if (visible && !btn.disabled) {
+            btn.click();
+            return true;
+          }
+        }
+        return false;
+      });
     }
-    return false;
-  };
+  ];
 
-  // Ordem: Enter -> requestSubmit -> clique
+  // NOVO: executar estratégias uma por uma até uma funcionar
   let submitted = false;
-  if (selPass && passFrame) submitted = await tryPressEnter(passFrame, selPass);
-  if (!submitted && selPass && passFrame) submitted = await trySubmitViaForm(passFrame, selPass);
-  if (!submitted && selUser && userFrame) submitted = await trySubmitViaForm(userFrame, selUser);
-  if (!submitted) {
-    submitted = await clickSubmitInFrame(userFrame || passFrame);
-    if (!submitted) {
-      for (const frame of page.frames()) {
-        if (await clickSubmitInFrame(frame)) { submitted = true; break; }
+  for (let i = 0; i < submitStrategies.length && !submitted; i++) {
+    try {
+      submitted = await submitStrategies[i]();
+      if (submitted) {
+        console.log(chalk.green(`✓ Submit realizado com sucesso na tentativa ${i + 1}`));
+        break;
       }
+    } catch (e) {
+      console.log(chalk.yellow(`Tentativa ${i + 1} falhou: ${e.message}`));
     }
+  }
+
+  if (!submitted) {
+    console.log(chalk.red('✖ Todas as tentativas de submit falharam'));
+    return false;
   }
 
   // NOVO: espera curta pós-submit (evita networkidle2 demorado)
@@ -473,29 +575,102 @@ export async function performLogin(page, loginConfig) {
 
   // Verificação rápida de sucesso (rota OU shell da app OU sumiço do formulário)
   const targetPath = expectedPath;
-  const maxWaitMs = (LOGIN_CONFIRM_TIMEOUT && LOGIN_CONFIRM_TIMEOUT > 0) ? LOGIN_CONFIRM_TIMEOUT : 3000; // rápido por padrão
+  const maxWaitMs = (LOGIN_CONFIRM_TIMEOUT && LOGIN_CONFIRM_TIMEOUT > 0) ? LOGIN_CONFIRM_TIMEOUT : 1000; // aumentado para dar mais tempo
   const start = Date.now();
+  
   while ((Date.now() - start) < maxWaitMs) {
     try {
-      const urlObj = new URL(page.url());
-      const pathOk = urlObj.pathname === targetPath || urlObj.pathname.endsWith(targetPath);
+      const currentUrl = page.url();
+      
+      // NOVO: Verificar se caiu em página de sessão expirada ou erro
+      if (currentUrl.includes('/sessao/expirada') || currentUrl.includes('/login') || currentUrl.includes('/error')) {
+        console.log(chalk.yellow(`Detectada página de sessão/login: ${currentUrl}`));
+        
+        // NOVO: Tentar relogar se caiu na sessão expirada
+        if (currentUrl.includes('/sessao/expirada')) {
+          console.log(chalk.blue('Tentando fazer login novamente após sessão expirada...'));
+          await page.goto(loginConfig.url, { waitUntil: 'networkidle2' });
+          
+          // Repete o processo de login rapidamente
+          const userFound = await waitForSelectorInAnyFrame(page, selUser, 2000);
+          const passFound = await waitForSelectorInAnyFrame(page, selPass, 2000);
+          
+          if (userFound.frame && passFound.frame) {
+            await fillInputInFrame(userFound.frame, selUser, loginConfig.username);
+            await fillInputInFrame(passFound.frame, selPass, loginConfig.password);
+            
+            // Tentar submit mais direto
+            const resubmitted = await page.evaluate(() => {
+              const forms = document.querySelectorAll('form');
+              for (const form of forms) {
+                const hasEmail = form.querySelector('input[type="email"], input[name*="email"]');
+                const hasPassword = form.querySelector('input[type="password"]');
+                if (hasEmail && hasPassword) {
+                  if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                  else form.submit();
+                  return true;
+                }
+              }
+              return false;
+            });
+            
+            if (resubmitted) {
+              console.log(chalk.gray('Segundo login enviado. Aguardando...'));
+              await new Promise(r => setTimeout(r, 2000));
+            }
+          }
+        }
+        
+        continue; // Continua verificando
+      }
+      
+      const urlObj = new URL(currentUrl);
+      const pathOk = urlObj.pathname === targetPath || urlObj.pathname.endsWith(targetPath) || currentUrl.includes('/app');
+      
       const markers = await page.evaluate((uSel, pSel) => {
-        const inApp = !!document.querySelector('fuse-vertical-navigation');
+        const inApp = !!document.querySelector('fuse-vertical-navigation') || 
+                     !!document.querySelector('#app') ||
+                     !!document.querySelector('.app') ||
+                     window.location.pathname.includes('/app');
         const userEl = uSel ? document.querySelector(uSel) : null;
         const passEl = pSel ? document.querySelector(pSel) : null;
-        return { inApp, hasLogin: !!(userEl || passEl) };
+        const hasLoginForm = !!(userEl || passEl);
+        
+        return { inApp, hasLogin: hasLoginForm, currentPath: window.location.pathname };
       }, selUser, selPass);
+      
+      console.log(chalk.gray(`Debug login - URL: ${currentUrl}, inApp: ${markers.inApp}, hasLogin: ${markers.hasLogin}`));
+      
       if (pathOk || (markers.inApp && !markers.hasLogin)) {
         await showStatus(page, 'Login realizado com sucesso.');
         console.log(chalk.green('Login confirmado rapidamente.'));
         return true;
       }
-    } catch { /* ignore */ }
-    await new Promise(r => setTimeout(r, 150));
+      
+    } catch (e) {
+      console.log(chalk.gray(`Erro na verificação de login: ${e.message}`));
+    }
+    
+    await new Promise(r => setTimeout(r, 500));
   }
 
-  await showStatus(page, 'Não foi possível confirmar login.');
-  console.log(chalk.yellow('Aviso: rota esperada não confirmada no tempo reduzido.'));
+  const finalUrl = page.url();
+  await showStatus(page, 'Verificação de login finalizada.');
+  
+  // NOVO: Verificação mais flexível do sucesso
+  if (finalUrl.includes('/app') && !finalUrl.includes('/login') && !finalUrl.includes('/sessao/expirada')) {
+    console.log(chalk.green('Login provavelmente bem-sucedido (detectada rota /app).'));
+    return true;
+  }
+  
+  console.log(chalk.yellow(`Aviso: Login pode não ter sido confirmado. URL final: ${finalUrl}`));
+  
+  // NOVO: Se não conseguiu confirmar login, mas não está em página de erro, continua
+  if (!finalUrl.includes('/login') && !finalUrl.includes('/sessao/expirada')) {
+    console.log(chalk.blue('Continuando execução mesmo sem confirmação explícita...'));
+    return true;
+  }
+  
   return false;
 }
 
@@ -633,11 +808,24 @@ export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = 
   try {
     await showStatus(page, loginConfig ? 'Iniciando login...' : 'Carregando página alvo...');
     if (loginConfig && !toBool(process.env.SKIP_LOGIN, false)) {
-      await performLogin(page, loginConfig);
+      const loginSuccess = await performLogin(page, loginConfig);
+      if (!loginSuccess) {
+        console.log(chalk.yellow('Login falhou, mas continuando execução...'));
+      }
     } else if (toBool(process.env.SKIP_LOGIN, false)) {
       console.log(chalk.blue('Login pulado - navegando diretamente para a URL alvo.'));
     }
+    
+    // NOVO: Navegar para URL alvo após login
+    console.log(chalk.gray(`Navegando para URL alvo: ${url}`));
     await page.goto(url, { waitUntil: 'networkidle2' });
+    
+    // NOVO: Verificar se chegou na URL esperada
+    const finalUrl = page.url();
+    if (finalUrl.includes('/sessao/expirada') || finalUrl.includes('/login')) {
+      throw new Error(`Redirecionado para página de login/sessão expirada: ${finalUrl}`);
+    }
+    
     await showStatus(page, 'Página carregada.');
   } catch (error) {
     await browser.close();

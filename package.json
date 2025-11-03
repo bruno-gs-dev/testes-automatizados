@@ -6,6 +6,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "discover": "node index.js discover",
+    "all-pages": "node index.js all-pages",
     "text": "node index.js text",
     "request": "node index.js request",
     "requests": "node index.js requests",

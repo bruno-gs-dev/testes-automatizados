@@ -62,8 +62,35 @@ async function main() {
   console.log(chalk.bold(`Validador - comando: ${arg}\n`));
   const results = { totalErros: 0 };
 
-  // --- NOVO RUNNER "ALL-PAGES" ---
-  if (arg === 'all-pages') {
+  // --- NOVO: COMANDO "DISCOVER" - APENAS DESCOBRIR LINKS ---
+  if (arg === 'discover') {
+    console.log(chalk.blue.bold(`🗺️  Executando APENAS descoberta de links...\n`));
+    let browser;
+    try {
+      const { browser: b, page } = await prepareBrowserPage(URL_ALVO, {}, LOGIN_CONFIG);
+      browser = b;
+
+      // Descobrir todos os links
+      const links = await discoverLinks(page);
+      console.log(chalk.green.bold(`\n🎯 Descoberta concluída! ${links.length} páginas mapeadas.`));
+      
+      // Relatório resumido
+      console.log(chalk.bold('\n--- Links Descobertos ---'));
+      links.forEach((link, index) => {
+        console.log(`${chalk.cyan(`${index + 1}.`)} ${link.text} ${chalk.gray(`(${link.href})`)}`);
+      });
+
+      return { totalErros: 0, linksEncontrados: links.length };
+    } catch (err) {
+      console.log(chalk.red.bold(`✖ FALHA na descoberta de links:`), err.message);
+      results.totalErros++;
+    } finally {
+      if (browser) await browser.close();
+    }
+  }
+
+  // --- RUNNER "ALL-PAGES" (com testes completos) ---
+  else if (arg === 'all-pages') {
     console.log(chalk.blue.bold(`🚀 Executando suíte de testes COMPLETA (todas as páginas)...\n`));
     let browser;
     try {
@@ -76,7 +103,15 @@ async function main() {
       const links = await discoverLinks(page);
       console.log(chalk.green.bold(`\n🗺️  Mapeamento concluído. ${links.length} páginas para testar.\n`));
       
-      // 3. Loop de teste
+      // 3. Perguntar se o usuário quer continuar com os testes
+      console.log(chalk.yellow.bold('❓ Deseja executar os testes em todas as páginas? (isso pode demorar)'));
+      console.log(chalk.gray('   Use Ctrl+C para cancelar e executar apenas "npm start discover" para mapear links.'));
+      console.log(chalk.blue('   Continuando em 5 segundos...\n'));
+      
+      // Pausa de 5 segundos para dar chance de cancelar
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      
+      // 4. Loop de teste
       for (let i = 0; i < links.length; i++) {
         const link = links[i];
         console.log(chalk.cyan.bold.inverse(`\n--- 🧪 TESTANDO PÁGINA [${i+1}/${links.length}]: ${link.text} ---`));
@@ -150,7 +185,6 @@ async function main() {
       if (browser) await browser.close();
     }
   }
-  // --- FIM DO NOVO RUNNER ---
   
   // Runners antigos (ainda funcionam individualmente)
   else {
