@@ -247,10 +247,11 @@ export async function detectApplicationType(page) {
   return types;
 }
 
-// ATUALIZADO: função de login mais genérica - CORRIGIDO: seletores CSS válidos
+// ATUALIZADO: função de login mais genérica - CORRIGIDO: evitar dupla navegação
 export async function performLogin(page, loginConfig) {
   const baseUrl = loginConfig.url;
   const expectedPath = loginConfig.expectedPath || '/';
+  
   // NOVO: Verificar se o login deve ser pulado
   if (toBool(process.env.SKIP_LOGIN, false)) {
     console.log(chalk.blue('Login pulado por configuração (SKIP_LOGIN=true).'));
@@ -575,7 +576,7 @@ export async function performLogin(page, loginConfig) {
 
   // Verificação rápida de sucesso (rota OU shell da app OU sumiço do formulário)
   const targetPath = expectedPath;
-  const maxWaitMs = (LOGIN_CONFIRM_TIMEOUT && LOGIN_CONFIRM_TIMEOUT > 0) ? LOGIN_CONFIRM_TIMEOUT : 1000; // aumentado para dar mais tempo
+  const maxWaitMs = (LOGIN_CONFIRM_TIMEOUT && LOGIN_CONFIRM_TIMEOUT > 0) ? LOGIN_CONFIRM_TIMEOUT : 1000;
   const start = Date.now();
   
   while ((Date.now() - start) < maxWaitMs) {
@@ -644,7 +645,7 @@ export async function performLogin(page, loginConfig) {
       if (pathOk || (markers.inApp && !markers.hasLogin)) {
         await showStatus(page, 'Login realizado com sucesso.');
         console.log(chalk.green('Login confirmado rapidamente.'));
-        return true;
+        return true; // MUDANÇA: Retorna true indicando que já está na página correta
       }
       
     } catch (e) {
@@ -660,7 +661,7 @@ export async function performLogin(page, loginConfig) {
   // NOVO: Verificação mais flexível do sucesso
   if (finalUrl.includes('/app') && !finalUrl.includes('/login') && !finalUrl.includes('/sessao/expirada')) {
     console.log(chalk.green('Login provavelmente bem-sucedido (detectada rota /app).'));
-    return true;
+    return true; // MUDANÇA: Retorna true indicando sucesso
   }
   
   console.log(chalk.yellow(`Aviso: Login pode não ter sido confirmado. URL final: ${finalUrl}`));
@@ -668,7 +669,7 @@ export async function performLogin(page, loginConfig) {
   // NOVO: Se não conseguiu confirmar login, mas não está em página de erro, continua
   if (!finalUrl.includes('/login') && !finalUrl.includes('/sessao/expirada')) {
     console.log(chalk.blue('Continuando execução mesmo sem confirmação explícita...'));
-    return true;
+    return true; // MUDANÇA: Retorna true para continuar
   }
   
   return false;
@@ -732,7 +733,7 @@ export async function takeScreenshot(page, selector, fileName) {
   }
 }
 
-// NOVO: prepara browser/page, listeners e login
+// NOVO: prepara browser/page, listeners e login - CORRIGIDO: evitar dupla navegação
 export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = null) {
   if (!fs.existsSync(SCREENSHOT_DIR)) {
     fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
@@ -807,18 +808,35 @@ export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = 
 
   try {
     await showStatus(page, loginConfig ? 'Iniciando login...' : 'Carregando página alvo...');
+    
     if (loginConfig && !toBool(process.env.SKIP_LOGIN, false)) {
       const loginSuccess = await performLogin(page, loginConfig);
       if (!loginSuccess) {
         console.log(chalk.yellow('Login falhou, mas continuando execução...'));
+        // MUDANÇA: Se login falhou, ainda tenta navegar para URL alvo
+        console.log(chalk.gray(`Navegando para URL alvo: ${url}`));
+        await page.goto(url, { waitUntil: 'networkidle2' });
+      } else {
+        // MUDANÇA: Se login foi bem-sucedido e já está na página correta, não navega novamente
+        const currentUrl = page.url();
+        const targetUrl = new URL(url);
+        const currentPath = new URL(currentUrl).pathname;
+        const targetPath = targetUrl.pathname;
+        
+        if (currentPath !== targetPath && !currentUrl.includes(targetPath)) {
+          console.log(chalk.gray(`Navegando para URL alvo específica: ${url}`));
+          await page.goto(url, { waitUntil: 'networkidle2' });
+        } else {
+          console.log(chalk.gray(`Já na página correta após login: ${currentUrl}`));
+        }
       }
     } else if (toBool(process.env.SKIP_LOGIN, false)) {
       console.log(chalk.blue('Login pulado - navegando diretamente para a URL alvo.'));
+      await page.goto(url, { waitUntil: 'networkidle2' });
+    } else {
+      // Sem login configurado, navega diretamente
+      await page.goto(url, { waitUntil: 'networkidle2' });
     }
-    
-    // NOVO: Navegar para URL alvo após login
-    console.log(chalk.gray(`Navegando para URL alvo: ${url}`));
-    await page.goto(url, { waitUntil: 'networkidle2' });
     
     // NOVO: Verificar se chegou na URL esperada
     const finalUrl = page.url();
