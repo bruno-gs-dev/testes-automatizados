@@ -8,7 +8,7 @@ Sistema completo de testes automatizados para validação de aplicações web ut
 - **📝 Validação de Texto**: Busca por conteúdos inválidos como "null", "NaN" e tokens customizados
 - **🌐 Validação de Requisições**: Monitora erros HTTP e falhas de rede
 - **🧭 Teste de Navegação**: Mapeia e testa todas as rotas da aplicação automaticamente
-- **📊 Relatórios Completos**: Gera logs detalhados e abre automaticamente no Bloco de Notas
+- **📊 Relatórios Profissionais**: Gera logs detalhados com estatísticas consolidadas
 - **📸 Screenshots**: Captura telas dos problemas encontrados (opcional)
 - **⚙️ Configuração Flexível**: Adapta-se automaticamente a diferentes tipos de aplicação
 
@@ -106,13 +106,13 @@ npm run start all
 npm run start all-pages
 ```
 
-## 🔧 Configuração para Diferentes Aplicações
+## 📊 Exemplos de Relatórios
 
-### Angular com Fuse Template
-```env
-NAV_TYPE=angular_fuse
-LOGIN_SELECTOR_USERNAME=#email
-LOGIN_SELECTOR_PASSWORD=#password
+### 🎉 Execução Bem-Sucedida
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                     📊 RELATÓRIO FINAL DE EXECUÇÃO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
 ### Bootstrap/Material UI

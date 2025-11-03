@@ -1,37 +1,24 @@
-// Salve este arquivo como: index.js
-// (Atualizado com o runner 'all-pages')
-
 import 'dotenv/config';
-// Usando import em vez de require
-import puppeteer from 'puppeteer';
 import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// --- NOVAS IMPORTAÇÕES ---
-// Importa o default (runColorTest) E a função nomeada (checkColorsOnPage)
 import runColorTest, { checkColorsOnPage } from './test_colors.js';
 import runTextTest, { checkTextOnPage } from './test_text.js';
 import runRequestsTest from './test_requests.js';
-// Importa o default (runNavigationTest) E a função nomeada (discoverLinks)
 import runNavigationTest, { discoverLinks } from './test_navigation.js';
 import runDebugTest from './test_navigation_debug.js';
 
-// Importamos prepareBrowserPage para o novo runner
 import { 
   showStatus, 
   LOGIN_CONFIG, 
   URL_ALVO, 
   prepareBrowserPage, 
-  SCREENSHOT_DIR // Import SCREENSHOT_DIR se takeScreenshot estiver aqui
 } from './utils.js';
-import { spawn } from 'child_process';
 
-// --- CONFIGURAÇÃO ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// --- FIM DA CONFIGURAÇÃO ---
 
 // NOVO: capturar logs e gerar .txt limpo (sem ANSI)
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
@@ -55,14 +42,91 @@ console.error = (...args) => {
   __origErr(...args);
 };
 
-// Substitui a execução monolítica por um runner simples de linha de comando.
 const arg = process.argv[2] ? process.argv[2].toLowerCase() : 'all';
 
+async function generateFinalReport(results, arg, startTime) {
+  const duration = Math.round((Date.now() - startTime) / 1000);
+  const minutes = Math.floor(duration / 60);
+  const seconds = duration % 60;
+  const timeStr = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+
+  console.log('\n' + '━'.repeat(80));
+  console.log(chalk.bold.cyan('                     📊 RELATÓRIO FINAL DE EXECUÇÃO'));
+  console.log('━'.repeat(80));
+  
+  // Header com informações básicas
+  console.log(chalk.gray(`🎯 Tipo de Teste: ${arg.toUpperCase()}`));
+  console.log(chalk.gray(`⏱️  Duração: ${timeStr}`));
+  console.log(chalk.gray(`🌐 URL Base: ${URL_ALVO.replace(/^https?:\/\//, '')}`));
+  if (results.linksTestados) {
+    console.log(chalk.gray(`📄 Páginas Testadas: ${results.linksTestados}`));
+  }
+  console.log('');
+
+  // Estatísticas por categoria
+  const stats = [
+    { name: 'Cores Inválidas', count: results.colorErrorCount || 0, icon: '🎨' },
+    { name: 'Textos Problemáticos', count: results.textErrorCount || 0, icon: '📝' },
+    { name: 'Erros de Requisição', count: results.requestErrorCount || 0, icon: '🌐' },
+    { name: 'Falhas de Navegação', count: results.navigationErrors || 0, icon: '🧭' }
+  ].filter(stat => stat.count !== undefined);
+
+  if (stats.length > 0) {
+    console.log(chalk.bold('📋 ESTATÍSTICAS DETALHADAS'));
+    console.log('┌─' + '─'.repeat(35) + '┬─' + '─'.repeat(10) + '┐');
+    console.log('│ ' + chalk.bold('Categoria').padEnd(34) + '│ ' + chalk.bold('Qtd').padStart(9) + ' │');
+    console.log('├─' + '─'.repeat(35) + '┼─' + '─'.repeat(10) + '┤');
+    
+    stats.forEach(stat => {
+      const color = stat.count > 0 ? chalk.red : chalk.green;
+      const countStr = stat.count.toString().padStart(9);
+      console.log(`│ ${stat.icon} ${stat.name.padEnd(31)} │ ${color(countStr)} │`);
+    });
+    
+    console.log('└─' + '─'.repeat(35) + '┴─' + '─'.repeat(10) + '┘');
+    console.log('');
+  }
+
+  // Status final
+  const totalErrors = results.totalErros || 0;
+  if (totalErrors === 0) {
+    console.log(chalk.green.bold('🎉 EXECUÇÃO CONCLUÍDA COM SUCESSO!'));
+    console.log(chalk.green('   ✓ Nenhum problema encontrado'));
+    if (results.linksEncontrados) {
+      console.log(chalk.green(`   ✓ ${results.linksEncontrados} páginas mapeadas`));
+    }
+  } else {
+    console.log(chalk.red.bold('⚠️  PROBLEMAS ENCONTRADOS'));
+    console.log(chalk.red(`   ✗ ${totalErrors} ${totalErrors === 1 ? 'problema' : 'problemas'} detectados`));
+    console.log(chalk.yellow('   💡 Consulte os detalhes acima para correções'));
+  }
+
+  // Links úteis
+  console.log('');
+  console.log(chalk.bold('📄 ARQUIVOS GERADOS'));
+  const logFile = path.join(__dirname, 'relatorio_logs.txt');
+  const linksFile = path.join(__dirname, 'links_map.json');
+  const screenshotsDir = path.join(__dirname, 'screenshots');
+  
+  console.log(chalk.gray(`   📝 Logs completos: ${path.basename(logFile)}`));
+  if (fs.existsSync(linksFile)) {
+    console.log(chalk.gray(`   🗺️  Mapa de links: ${path.basename(linksFile)}`));
+  }
+  if (fs.existsSync(screenshotsDir) && fs.readdirSync(screenshotsDir).length > 0) {
+    const screenshotCount = fs.readdirSync(screenshotsDir).length;
+    console.log(chalk.gray(`   📸 Screenshots: ${screenshotCount} arquivos em ${path.basename(screenshotsDir)}/`));
+  }
+
+  console.log('━'.repeat(80));
+  
+  return totalErrors === 0 ? 0 : 1; // Exit code
+}
+
 async function main() {
-  console.log(chalk.bold(`Validador - comando: ${arg}\n`));
+  const startTime = Date.now();
+  console.log(chalk.bold(`🤖 Validador Web - Comando: ${arg}\n`));
   const results = { totalErros: 0 };
 
-  // --- NOVO: COMANDO "DISCOVER" - APENAS DESCOBRIR LINKS ---
   if (arg === 'discover') {
     console.log(chalk.blue.bold(`🗺️  Executando APENAS descoberta de links...\n`));
     let browser;
@@ -89,7 +153,6 @@ async function main() {
     }
   }
 
-  // --- RUNNER "ALL-PAGES" (com testes completos) ---
   else if (arg === 'all-pages') {
     console.log(chalk.blue.bold(`🚀 Executando suíte de testes COMPLETA (todas as páginas)...\n`));
     let browser;
@@ -150,28 +213,37 @@ async function main() {
         // c. Rodar os testes na página atual
         
         // Teste de Requisições
-        console.log(chalk.bold('\n--- Relatório de Requisições (Página) ---'));
+        console.log(chalk.bold('\n🌐 Verificando Requisições...'));
         if (requestErrors.length > 0) {
           requestErrors.forEach(error => {
-            console.log(`${chalk.red.bold(`✖ ERRO DE REQUISIÇÃO:`)} [${error.type}]`);
-            if (error.status) console.log(`  Status: ${chalk.yellow(error.status)}`);
-            console.log(`  URL: ${error.url}`);
-            if (error.error) console.log(`  Motivo: ${error.error}`);
+            console.log(`${chalk.red.bold(`✖`)} ${error.type} - ${chalk.gray(error.url.substring(0, 60))}${error.url.length > 60 ? '...' : ''}`);
+            if (error.status) console.log(`   Status: ${chalk.yellow(error.status)}`);
           });
           results.totalErros += requestErrors.length;
+          results.requestErrorCount += requestErrors.length;
         } else {
-          console.log(chalk.green('Nenhuma requisição com erro encontrada.'));
+          console.log(chalk.green('✓ Requisições OK'));
         }
         
         // Teste de Cores
+        console.log(chalk.bold('\n🎨 Verificando Cores...'));
         const colorResults = await checkColorsOnPage(page);
         results.totalErros += colorResults.totalErros;
+        results.colorErrorCount += colorResults.colorErrorCount || 0;
+        if ((colorResults.colorErrorCount || 0) === 0) {
+          console.log(chalk.green('✓ Cores OK'));
+        }
         
         // Teste de Texto
+        console.log(chalk.bold('\n📝 Verificando Textos...'));
         const textResults = await checkTextOnPage(page);
         results.totalErros += textResults.totalErros;
+        results.textErrorCount += textResults.textErrorCount || 0;
+        if ((textResults.textErrorCount || 0) === 0) {
+          console.log(chalk.green('✓ Textos OK'));
+        }
         
-        console.log(chalk.cyan.bold('--- FIM DOS TESTES DA PÁGINA ---'));
+        console.log(chalk.cyan.bold(`\n✅ Página [${i+1}/${links.length}] concluída`));
 
         // d. Limpar listeners
         page.off('response', responseListener);
@@ -186,23 +258,26 @@ async function main() {
     }
   }
   
-  // Runners antigos (ainda funcionam individualmente)
   else {
     if (arg === 'colors' || arg === 'all') {
       const res = await runColorTest();
       results.totalErros += (res && res.totalErros) ? res.totalErros : 0;
+      results.colorErrorCount = (res && res.colorErrorCount) ? res.colorErrorCount : 0;
     }
     if (arg === 'text' || arg === 'all') {
       const res = await runTextTest();
       results.totalErros += (res && res.totalErros) ? res.totalErros : 0;
+      results.textErrorCount = (res && res.textErrorCount) ? res.textErrorCount : 0;
     }
     if (arg === 'requests' || arg === 'request' || arg === 'all') {
       const res = await runRequestsTest();
       results.totalErros += (res && res.totalErros) ? res.totalErros : 0;
+      results.requestErrorCount = (res && res.requestErrorCount) ? res.requestErrorCount : 0;
     }
     if (arg === 'navigation' || arg === 'all') {
       const res = await runNavigationTest();
       results.totalErros += (res && res.totalErros) ? res.totalErros : 0;
+      results.navigationErrors = (res && res.totalErros) ? res.totalErros : 0;
     }
     if (arg === 'debug') {
       const res = await runDebugTest();
@@ -210,24 +285,16 @@ async function main() {
     }
   }
 
-  // --- Resumo Final ---
-  console.log('\n----------------------------------------------------');
-  console.log(chalk.bold('Resumo Final da Execução:'));
-  if (results.totalErros === 0) {
-    console.log(chalk.green.bold.inverse(' ✅ SUCESSO TOTAL! '),'Nenhum erro encontrado em toda a suíte.');
-  } else {
-    console.log(chalk.red.bold.inverse(' ❌ FALHA! '),'Foram encontrados', results.totalErros, 'problemas no total.');
-  }
-
-  // NOVO: salvar logs em .txt (sem abrir automaticamente)
+  // --- Salvar logs e gerar relatório final ---
   try {
     const logFile = path.join(__dirname, 'relatorio_logs.txt');
     fs.writeFileSync(logFile, LOG_BUFFER.join('\n'), 'utf8');
-    console.log(chalk.gray(`\nLogs completos salvos em: ${logFile}`));
-    // REMOVIDO: abertura automática do Bloco de Notas
   } catch (e) {
     console.error('Falha ao salvar o arquivo de logs:', e.message);
   }
+
+  const exitCode = await generateFinalReport(results, arg, startTime);
+  process.exit(exitCode);
 }
 
 main();
