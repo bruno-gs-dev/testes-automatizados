@@ -44,6 +44,9 @@ console.error = (...args) => {
 
 const arg = process.argv[2] ? process.argv[2].toLowerCase() : 'all';
 
+// NOVO: flag para ignorar "Network Failure"
+const IGNORE_NETWORK_FAILURE = String(process.env.IGNORE_NETWORK_FAILURE || '').toLowerCase() === 'true';
+
 async function generateFinalReport(results, arg, startTime) {
   const duration = Math.round((Date.now() - startTime) / 1000);
   const minutes = Math.floor(duration / 60);
@@ -190,6 +193,8 @@ async function main() {
           }
         };
         const requestFailedListener = (request) => {
+          // NOVO: respeitar flag para ignorar "Network Failure"
+          if (IGNORE_NETWORK_FAILURE) return;
           requestErrors.push({
             type: 'Network Failure', url: request.url(), error: request.failure() ? request.failure().errorText : 'unknown',
           });

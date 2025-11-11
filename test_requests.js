@@ -1,21 +1,157 @@
 import chalk from 'chalk';
-import { URL_ALVO, prepareBrowserPage, showStatus, LOGIN_CONFIG, loadLinksMap } from './utils.js';
+import { URL_ALVO, prepareBrowserPage, showStatus, LOGIN_CONFIG, loadLinksMap, performLogin } from './utils.js';
+
+// NOVO: flag para ignorar "Network Failure"
+const IGNORE_NETWORK_FAILURE = String(process.env.IGNORE_NETWORK_FAILURE || '').toLowerCase() === 'true';
+
+// CORRIGIDO: Declarar LOGIN_REQUIRED corretamente aqui também se necessário
+const toBool = (v, def = false) => {
+  if (v == null) return def;
+  const s = String(v).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on', 'new'].includes(s);
+};
+const LOGIN_REQUIRED = toBool(process.env.LOGIN_REQUIRED, false);
+
+// NOVO: tempos configuráveis (com defaults)
+const WAIT_AFTER_LOAD_MS = parseInt(process.env.REQ_WAIT_AFTER_LOAD_MS || process.env.CORS_DETECTION_WAIT || '2000', 10);
+const WAIT_AFTER_TRIGGER_MS = parseInt(process.env.REQ_WAIT_AFTER_TRIGGER_MS || '1000', 10);
+const MAX_PAGE_TEST_MS = parseInt(process.env.REQ_MAX_PAGE_TEST_MS || '8000', 10);
+
+// NOVO: helper de espera com polling e early-exit
+async function waitUntil(predicate, timeoutMs, pollMs = 150) {
+  const start = Date.now();
+  return new Promise(resolve => {
+    const int = setInterval(() => {
+      if (predicate()) {
+        clearInterval(int);
+        resolve(true);
+      } else if (Date.now() - start >= timeoutMs) {
+        clearInterval(int);
+        resolve(false);
+      }
+    }, pollMs);
+  });
+}
+
+// NOVO: Função otimizada para preparar browser apenas para requisições
+async function prepareBrowserForRequests(url, loginConfig = null) {
+  const puppeteer = (await import('puppeteer')).default;
+  
+  // NOVO: Configuração otimizada apenas para requisições
+  const browser = await puppeteer.launch({
+    headless: true, // SEMPRE headless para requisições
+    defaultViewport: { width: 1024, height: 768 }, // Viewport mínimo
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      // REMOVIDO: '--disable-web-security' (pode mascarar CORS e interferir no login)
+      '--disable-dev-shm-usage',
+      '--disable-plugins',
+      '--disable-extensions',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding'
+    ]
+  });
+  
+  const page = await browser.newPage();
+
+  // Desabilitar timeouts
+  page.setDefaultTimeout(0);
+  page.setDefaultNavigationTimeout(0);
+
+  // Array compartilhado de erros
+  const requestErrors = [];
+
+  // NOVO: Executar login robusto (mesmo do modo normal)
+  if (loginConfig && loginConfig.username && loginConfig.password) {
+    try {
+      // Usa a rotina completa do utils (detecta iframes, espera, etc.)
+      await performLogin(page, loginConfig);
+    } catch (e) {
+      console.log(chalk.yellow('Aviso: Login (performLogin) falhou, continuando...'));
+    }
+  }
+
+  // NOVO: após login, garantir que estamos na URL alvo inicial
+  try {
+    if (url) {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    }
+  } catch { /* ignore */ }
+
+  // NOVO: Ativar interceptação e bloqueio LEVE somente após o login
+  await page.setRequestInterception(true);
+  page.on('request', (request) => {
+    const resourceType = request.resourceType();
+    // Bloquear apenas recursos pesados, manter scripts/stylesheet para funcionamento e CORS
+    if (['image', 'font', 'media'].includes(resourceType)) {
+      request.abort();
+    } else {
+      request.continue();
+    }
+  });
+
+  // NOVO: listeners de rede após login
+  page.on('response', response => {
+    try {
+      if (!response.ok()) {
+        requestErrors.push({ 
+          type: 'HTTP Error', 
+          status: response.status(), 
+          url: response.url(),
+          method: response.request().method(),
+          statusText: response.statusText()
+        });
+      }
+    } catch { /* ignore */ }
+  });
+  
+  page.on('requestfailed', request => {
+    try {
+      const resourceType = request.resourceType();
+      if (!['image', 'font', 'media'].includes(resourceType)) {
+        // NOVO: respeitar flag para ignorar "Network Failure"
+        if (IGNORE_NETWORK_FAILURE) return;
+        const failure = request.failure();
+        requestErrors.push({ 
+          type: 'Network Failure', 
+          url: request.url(), 
+          method: request.method(),
+          error: failure ? failure.errorText : 'unknown',
+          resourceType
+        });
+      }
+    } catch { /* ignore */ }
+  });
+
+  // REMOVIDO: login simplificado local (passava só no frame principal e sem wait)
+  // ...existing code...
+
+  return { browser, page, requestErrors };
+}
 
 export default async function runRequestsTest() {
-  console.log(chalk.blue(`Executando teste de REQUISIÇÕES para: ${URL_ALVO}\n`));
+  console.log(chalk.blue(`🌐 Executando teste de REQUISIÇÕES (modo otimizado) para: ${URL_ALVO}\n`));
   let browser;
+  
   try {
     // NOVO: usar loader unificado (TS/JS/JSON)
     const { links, source: linksSource } = await loadLinksMap();
+    
     if (links && links.length) {
       console.log(chalk.gray(`Usando ${links.length} links de: ${linksSource}`));
-      const { browser: b, page } = await prepareBrowserPage(URL_ALVO, {}, LOGIN_CONFIG);
+      console.log(chalk.blue('⚡ Modo otimizado: recursos visuais desabilitados, foco em requisições HTTP\n'));
+      
+      const { browser: b, page } = await prepareBrowserForRequests(URL_ALVO, LOGIN_CONFIG);
       browser = b;
+      
       let totalErros = 0;
       let requestErrorCount = 0;
       const allErrors = new Map(); // Agrupar erros por URL
+      const requestErrors = []; // NOVO: array para relatório final
 
-      console.log(chalk.cyan('\n📊 Iniciando análise de requisições...\n'));
+      console.log(chalk.cyan('📊 Iniciando análise de requisições...\n'));
 
       for (let i = 0; i < links.length; i++) {
         const link = links[i];
@@ -24,29 +160,235 @@ export default async function runRequestsTest() {
         // Progresso visual melhorado
         process.stdout.write(chalk.gray(`[${progress}] ${link.text.substring(0, 40)}${link.text.length > 40 ? '...' : ''}`));
 
-        const requestErrors = [];
+        const pageRequestErrors = [];
+        
+        // NOVO: Listeners temporários para esta página específica
         const responseListener = (response) => {
           try {
             if (!response.ok()) {
-              requestErrors.push({ type: 'HTTP Error', status: response.status(), url: response.url() });
+              pageRequestErrors.push({ 
+                type: 'HTTP Error', 
+                status: response.status(), 
+                url: response.url(),
+                method: response.request().method(),
+                pageUrl: link.href,
+                pageTitle: link.text,
+                statusText: response.statusText()
+              });
             }
           } catch { /* ignore */ }
         };
+        
         const requestFailedListener = (request) => {
           try {
-            requestErrors.push({ type: 'Network Failure', url: request.url(), error: request.failure() ? request.failure().errorText : 'unknown' });
+            const resourceType = request.resourceType();
+            if (!['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+              // NOVO: respeitar flag para ignorar "Network Failure"
+              if (IGNORE_NETWORK_FAILURE) return;
+              pageRequestErrors.push({ 
+                type: 'Network Failure', 
+                url: request.url(), 
+                method: request.method(),
+                error: request.failure() ? request.failure().errorText : 'unknown',
+                pageUrl: link.href,
+                pageTitle: link.text,
+                resourceType: resourceType
+              });
+            }
           } catch { /* ignore */ }
         };
+        
+        // CORRIGIDO: Listener de console específico para esta página
+        const consoleListener = (msg) => {
+          try {
+            const text = msg.text();
+            const type = msg.type();
+            
+            // REMOVIDO: Log de debug excessivo que estava poluindo o console
+            // if (type === 'error') {
+            //   console.log(`[DEBUG] Console error: ${text.substring(0, 100)}${text.length > 100 ? '...' : ''}`);
+            // }
+            
+            // NOVO: Detectar erros de CORS mais específicos - PADRÕES APRIMORADOS
+            if (type === 'error') {
+              // NOVO: Padrões mais específicos para CORS incluindo o erro específico que você mencionou
+              const corsPatterns = [
+                // Padrão específico do seu erro
+                /Access to XMLHttpRequest at '([^']+)' from origin '[^']+' has been blocked by CORS policy/i,
+                /Access to fetch at '([^']+)' from origin '[^']+' has been blocked by CORS policy/i,
+                // Padrões mais genéricos
+                /Access to XMLHttpRequest at '([^']+)'.*has been blocked by CORS policy/i,
+                /Access to fetch at '([^']+)'.*has been blocked by CORS policy/i,
+                /Cross-Origin Request Blocked:[^']*'([^']+)'/i,
+                /CORS policy:[^']*'([^']+)'/i,
+                // Padrão ainda mais genérico para casos edge
+                /'([^']+)'.*blocked by CORS policy/i
+              ];
+              
+              let corsMatch = null;
+              let corsUrl = 'Unknown URL';
+              
+              for (const pattern of corsPatterns) {
+                corsMatch = text.match(pattern);
+                if (corsMatch) {
+                  corsUrl = corsMatch[1];
+                  console.log(`[DEBUG] ✓ CORS URL extracted: ${corsUrl}`);
+                  break;
+                }
+              }
+              
+              // NOVO: Detectar padrão mais genérico de CORS se não encontrou com regex
+              if (!corsMatch && (
+                text.includes('has been blocked by CORS policy') ||
+                text.includes('No \'Access-Control-Allow-Origin\' header is present') ||
+                text.includes('Cross-Origin Request Blocked')
+              )) {
+                // Tentar extrair URL de qualquer parte do texto
+                const urlMatch = text.match(/(https?:\/\/[^\s'",\)]+)/i);
+                if (urlMatch) {
+                  corsUrl = urlMatch[1];
+                  corsMatch = true;
+                  console.log(`[DEBUG] ✓ CORS URL extracted (generic): ${corsUrl}`);
+                }
+              }
+              
+              if (corsMatch) {
+                pageRequestErrors.push({
+                  type: 'CORS Error',
+                  url: corsUrl,
+                  method: 'XMLHttpRequest',
+                  error: text,
+                  source: 'Console',
+                  statusText: 'CORS Policy Violation',
+                  pageUrl: link.href,
+                  pageTitle: link.text
+                });
+                console.log(`[DEBUG] ✓ CORS error added successfully`);
+                return; // Não duplicar detecção
+              }
+              
+              // NOVO: Detectar erros de rede específicos com MELHOR extração de URL
+              const networkPatterns = [
+                // Padrões que extraem URL do contexto
+                /GET (https?:\/\/[^\s]+) net::ERR_FAILED/i,
+                /POST (https?:\/\/[^\s]+) net::ERR_FAILED/i,
+                /PUT (https?:\/\/[^\s]+) net::ERR_FAILED/i,
+                /DELETE (https?:\/\/[^\s]+) net::ERR_FAILED/i,
+                // Padrão mais genérico
+                /(https?:\/\/[^\s'",\)]+).*net::ERR_FAILED/i,
+                /Failed to load resource:.*?(https?:\/\/[^\s'",\)]+)/i,
+              ];
+              
+              let networkMatch = null;
+              let networkUrl = 'Unknown URL';
+              
+              for (const pattern of networkPatterns) {
+                networkMatch = text.match(pattern);
+                if (networkMatch) {
+                  networkUrl = networkMatch[1];
+                  // REMOVIDO: log excessivo console.log(`[DEBUG] ✓ Network error URL extracted: ${networkUrl}`);
+                  break;
+                }
+              }
+              
+              // NOVO: Padrão genérico melhorado para net::ERR_FAILED
+              if (!networkMatch && text.includes('net::ERR_FAILED')) {
+                // Extrair qualquer URL do texto
+                const urlMatch = text.match(/(https?:\/\/[^\s'",\)]+)/i);
+                if (urlMatch) {
+                  networkUrl = urlMatch[1];
+                  networkMatch = true;
+                  // REMOVIDO: log excessivo console.log(`[DEBUG] ✓ Network error URL extracted (fallback): ${networkUrl}`);
+                } else {
+                  // Se não conseguir extrair URL, pelo menos registra o erro
+                  networkMatch = true;
+                  // REMOVIDO: log excessivo console.log(`[DEBUG] ✓ Network error detected (no URL extracted)`);
+                }
+              }
+              
+              if (networkMatch) {
+                // NOVO: respeitar flag para ignorar "Network Error (Console)"
+                if (IGNORE_NETWORK_FAILURE) return;
+                pageRequestErrors.push({
+                  type: 'Network Error (Console)',
+                  url: networkUrl,
+                  method: 'Unknown',
+                  error: text,
+                  source: 'Console',
+                  statusText: 'Network Failure',
+                  pageUrl: link.href,
+                  pageTitle: link.text
+                });
+              }
+            }
+          } catch (e) {
+            console.log(`[DEBUG] ✖ Error in consoleListener: ${e.message}`);
+          }
+        };
+        
+        // Adicionar listeners
         page.on('response', responseListener);
         page.on('requestfailed', requestFailedListener);
+        page.on('console', consoleListener);
 
         try {
-          await page.goto(link.href, { waitUntil: 'networkidle2' });
-          
+          // Navegação rápida
+          await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+          // NOVO: janela total de teste por página
+          const pageStart = Date.now();
+          const hasCors = () => pageRequestErrors.some(e => e.type === 'CORS Error');
+
+          // NOVO: fase 1 — aguarda primeiro erro aparecer OU timeout curto
+          await waitUntil(() => pageRequestErrors.length > 0, Math.min(WAIT_AFTER_LOAD_MS, MAX_PAGE_TEST_MS));
+
+          // NOVO: dispara possíveis requisições da tela
+          await page.evaluate(() => {
+            try {
+              const buttons = document.querySelectorAll('button, [role="button"], .btn');
+              const links = document.querySelectorAll('a[href], [role="link"]');
+              const inputs = document.querySelectorAll('input, select');
+              [buttons[0], links[0], inputs[0]].forEach(el => {
+                if (!el) return;
+                try {
+                  el.focus();
+                  el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                  el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                } catch {}
+              });
+            } catch {}
+          });
+
+          // NOVO: fase 2 — aguarda pouco OU sai antes se já pegou CORS
+          if (!hasCors()) {
+            const restante = Math.max(0, MAX_PAGE_TEST_MS - (Date.now() - pageStart));
+            await waitUntil(() => hasCors(), Math.min(WAIT_AFTER_TRIGGER_MS, restante));
+          }
+
+          // NOVO: garante que não ultrapasse o tempo total por página
+          if (Date.now() - pageStart > MAX_PAGE_TEST_MS) {
+            // continua para o processamento sem atrasar mais
+          }
+
           // Processar erros encontrados
-          if (requestErrors.length > 0) {
-            process.stdout.write(chalk.red(` ✖ ${requestErrors.length} erro(s)\n`));
-            requestErrors.forEach(error => {
+          if (pageRequestErrors.length > 0) {
+            process.stdout.write(chalk.red(` ✖ ${pageRequestErrors.length} erro(s)\n`));
+            
+            // NOVO: Agrupar erros por tipo para melhor visualização
+            const errorsByType = {};
+            pageRequestErrors.forEach(error => {
+              if (!errorsByType[error.type]) {
+                errorsByType[error.type] = [];
+              }
+              errorsByType[error.type].push(error);
+            });
+            
+            // Mostrar resumo por tipo de erro
+            Object.entries(errorsByType).forEach(([type, errors]) => {
+              console.log(chalk.gray(`     └─ ${type}: ${errors.length} erro(s)`));
+            });
+            
+            pageRequestErrors.forEach(error => {
               const key = `${error.url}|${error.type}`;
               if (allErrors.has(key)) {
                 allErrors.get(key).count++;
@@ -58,6 +400,10 @@ export default async function runRequestsTest() {
                   pages: [link.text]
                 });
               }
+              
+              // NOVO: Adicionar ao array para relatório final
+              requestErrors.push(error);
+              
               totalErros++;
               requestErrorCount++;
             });
@@ -70,8 +416,10 @@ export default async function runRequestsTest() {
           totalErros++;
         }
 
+        // Limpar listeners
         page.off('response', responseListener);
         page.off('requestfailed', requestFailedListener);
+        page.off('console', consoleListener);
       }
 
       // Relatório consolidado
@@ -84,9 +432,12 @@ export default async function runRequestsTest() {
         let errorIndex = 1;
         for (const [key, errorData] of allErrors) {
           console.log(chalk.red(`${errorIndex}. ${errorData.type}`));
-          if (errorData.status) console.log(chalk.yellow(`   Status: ${errorData.status}`));
+          if (errorData.status) console.log(chalk.yellow(`   Status: ${errorData.status} ${errorData.statusText || ''}`));
+          if (errorData.method) console.log(chalk.blue(`   Método: ${errorData.method}`));
           console.log(chalk.gray(`   URL: ${errorData.url}`));
           if (errorData.error) console.log(chalk.gray(`   Motivo: ${errorData.error}`));
+          if (errorData.resourceType) console.log(chalk.cyan(`   Tipo: ${errorData.resourceType}`));
+          if (errorData.source) console.log(chalk.magenta(`   Origem: ${errorData.source}`));
           console.log(chalk.blue(`   Ocorrências: ${errorData.count}x`));
           
           if (errorData.pages.length <= 3) {
@@ -104,37 +455,64 @@ export default async function runRequestsTest() {
       }
 
       console.log('━'.repeat(60));
-      await showStatus(page, 'Análise de requisições concluída.');
-      return { totalErros, requestErrorCount };
+      
+      // NOVO: Retornar erros detalhados para o relatório final
+      return { 
+        totalErros, 
+        requestErrorCount,
+        requestErrors // NOVO: incluir array de erros para o relatório final
+      };
     }
 
-    // fallback: comportamento antigo (página única)
-    const { browser: b, page, requestErrors } = await prepareBrowserPage(URL_ALVO, {}, LOGIN_CONFIG);
+    // fallback: comportamento antigo (página única) - também otimizado
+    console.log(chalk.blue('⚡ Modo otimizado: recursos visuais desabilitados, foco em requisições HTTP\n'));
+    
+    const { browser: b, page, requestErrors } = await prepareBrowserForRequests(URL_ALVO, LOGIN_CONFIG);
     browser = b;
 
-    await showStatus(page, 'Verificando erros de rede...');
-    console.log(chalk.bold('\n--- Relatório de Requisições ---'));
+    console.log(chalk.bold('\n--- Relatório de Requisições (Página Única) ---'));
     if (requestErrors.length > 0) {
       let totalErros = 0;
+      const formattedErrors = [];
+      
       requestErrors.forEach(error => {
         totalErros++;
         console.log(`${chalk.red.bold(`✖ ERRO DE REQUISIÇÃO:`)} [${error.type}]`);
         if (error.status) console.log(`  Status: ${chalk.yellow(error.status)}`);
+        if (error.method) console.log(`  Método: ${chalk.blue(error.method)}`);
         console.log(`  URL: ${error.url}`);
         if (error.error) console.log(`  Motivo: ${error.error}`);
+        
+        // NOVO: Adicionar contexto para página única
+        formattedErrors.push({
+          ...error,
+          pageUrl: URL_ALVO,
+          pageTitle: 'Página Principal'
+        });
       });
+      
       console.log('\n----------------------------------------------------');
-      await showStatus(page, 'Relatório de requisições concluído (erros encontrados).');
-      return { totalErros, requestErrorCount: requestErrors.length };
+      return { 
+        totalErros, 
+        requestErrorCount: requestErrors.length,
+        requestErrors: formattedErrors
+      };
     } else {
       console.log(chalk.green('Nenhuma requisição com erro encontrada.'));
       console.log('\n----------------------------------------------------');
-      await showStatus(page, 'Relatório de requisições concluído (sem erros).');
-      return { totalErros: 0, requestErrorCount: 0 };
+      return { 
+        totalErros: 0, 
+        requestErrorCount: 0,
+        requestErrors: []
+      };
     }
   } catch (err) {
     console.log(chalk.red.bold('✖ FALHA CRÍTICA:'), err.message);
-    return { totalErros: 1, requestErrorCount: 1 };
+    return { 
+      totalErros: 1, 
+      requestErrorCount: 1,
+      requestErrors: []
+    };
   } finally {
     if (browser) await browser.close();
   }
