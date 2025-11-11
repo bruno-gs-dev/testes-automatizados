@@ -45,12 +45,14 @@ async function prepareBrowserForRequests(url, loginConfig = null) {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-gpu',
-      // REMOVIDO: '--disable-web-security' (pode mascarar CORS e interferir no login)
       '--disable-dev-shm-usage',
       '--disable-plugins',
       '--disable-extensions',
       '--disable-background-timer-throttling',
-      '--disable-renderer-backgrounding'
+      '--disable-renderer-backgrounding',
+      // NOVO: argumentos para manter sessão
+      '--disable-session-crashed-bubble',
+      '--disable-infobars'
     ]
   });
   
@@ -60,6 +62,11 @@ async function prepareBrowserForRequests(url, loginConfig = null) {
   page.setDefaultTimeout(0);
   page.setDefaultNavigationTimeout(0);
 
+  // NOVO: Configurar cookies e sessão
+  await page.setExtraHTTPHeaders({
+    'Cache-Control': 'no-cache'
+  });
+
   // Array compartilhado de erros
   const requestErrors = [];
 
@@ -67,18 +74,39 @@ async function prepareBrowserForRequests(url, loginConfig = null) {
   if (loginConfig && loginConfig.username && loginConfig.password) {
     try {
       // Usa a rotina completa do utils (detecta iframes, espera, etc.)
-      await performLogin(page, loginConfig);
+      const loginSuccess = await performLogin(page, loginConfig);
+      if (!loginSuccess) {
+        console.log(chalk.yellow('Aviso: Login (performLogin) falhou, continuando...'));
+      } else {
+        // NOVO: Aguardar após login para estabilizar
+        console.log(chalk.gray('Login bem-sucedido, aguardando estabilização da sessão...'));
+        await new Promise(r => setTimeout(r, 3000));
+      }
     } catch (e) {
-      console.log(chalk.yellow('Aviso: Login (performLogin) falhou, continuando...'));
+      console.log(chalk.yellow(`Aviso: Login falhou com erro: ${e.message}`));
     }
   }
 
   // NOVO: após login, garantir que estamos na URL alvo inicial
   try {
     if (url) {
+      // NOVO: Verificar se não está em página de login antes de navegar
+      const currentUrl = page.url();
+      if (currentUrl.includes('/login') || currentUrl.includes('/sessao/expirada')) {
+        console.log(chalk.yellow(`Aviso: Ainda em página de login: ${currentUrl}`));
+      }
+      
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      
+      // NOVO: Verificar se foi redirecionado para login após navegação
+      const finalUrl = page.url();
+      if (finalUrl.includes('/login') || finalUrl.includes('/sessao/expirada')) {
+        console.log(chalk.yellow(`Aviso: Redirecionado para login após navegação: ${finalUrl}`));
+      }
     }
-  } catch { /* ignore */ }
+  } catch (navError) {
+    console.log(chalk.yellow(`Aviso: Erro na navegação inicial: ${navError.message}`));
+  }
 
   // NOVO: Ativar interceptação e bloqueio LEVE somente após o login
   await page.setRequestInterception(true);
@@ -130,6 +158,12 @@ async function prepareBrowserForRequests(url, loginConfig = null) {
 
   return { browser, page, requestErrors };
 }
+
+// NOVO: flags para captura de erros de console
+const CAPTURE_JS_CONSOLE_ERRORS = toBool(process.env.CAPTURE_JS_CONSOLE_ERRORS, false);
+const IGNORE_CONSOLE_PATTERNS = process.env.IGNORE_CONSOLE_PATTERNS 
+  ? process.env.IGNORE_CONSOLE_PATTERNS.split(',').map(p => p.trim().toLowerCase())
+  : [];
 
 export default async function runRequestsTest() {
   console.log(chalk.blue(`🌐 Executando teste de REQUISIÇÕES (modo otimizado) para: ${URL_ALVO}\n`));
@@ -198,16 +232,66 @@ export default async function runRequestsTest() {
           } catch { /* ignore */ }
         };
         
-        // CORRIGIDO: Listener de console específico para esta página
+        // CORRIGIDO: Listener de console aprimorado para capturar mais tipos de erro
         const consoleListener = (msg) => {
           try {
             const text = msg.text();
             const type = msg.type();
             
-            // REMOVIDO: Log de debug excessivo que estava poluindo o console
-            // if (type === 'error') {
-            //   console.log(`[DEBUG] Console error: ${text.substring(0, 100)}${text.length > 100 ? '...' : ''}`);
-            // }
+            // NOVO: Capturar erros de console JavaScript se habilitado
+            if (CAPTURE_JS_CONSOLE_ERRORS && (type === 'error' || type === 'warning')) {
+              // Verificar se deve ignorar baseado nos padrões
+              const shouldIgnore = IGNORE_CONSOLE_PATTERNS.some(pattern => 
+                text.toLowerCase().includes(pattern)
+              );
+              
+              if (!shouldIgnore) {
+                // NOVO: Detectar diferentes tipos de erro de console
+                let errorType = 'Console Error';
+                let errorUrl = 'Unknown';
+                let errorDetails = text;
+
+                // Detectar erros específicos do JavaScript
+                if (text.includes('Uncaught TypeError') || text.includes('TypeError:')) {
+                  errorType = 'JavaScript TypeError';
+                } else if (text.includes('Uncaught ReferenceError') || text.includes('ReferenceError:')) {
+                  errorType = 'JavaScript ReferenceError';
+                } else if (text.includes('Uncaught SyntaxError') || text.includes('SyntaxError:')) {
+                  errorType = 'JavaScript SyntaxError';
+                } else if (text.includes('Cannot read properties') || text.includes('Cannot set properties')) {
+                  errorType = 'JavaScript Property Error';
+                } else if (text.includes('This site overrides Date.now()')) {
+                  errorType = 'Google Maps API Warning';
+                } else if (text.includes('Failed to load resource')) {
+                  errorType = 'Resource Load Error';
+                } else if (type === 'warning') {
+                  errorType = 'Console Warning';
+                }
+
+                // Tentar extrair URL/arquivo do erro
+                const fileMatch = text.match(/(\S+\.js)(\?\S+)?:(\d+):(\d+)/);
+                if (fileMatch) {
+                  errorUrl = `${fileMatch[1]} (linha ${fileMatch[3]})`;
+                }
+
+                pageRequestErrors.push({
+                  type: errorType,
+                  url: errorUrl,
+                  method: 'Console',
+                  error: errorDetails.length > 200 ? errorDetails.substring(0, 200) + '...' : errorDetails,
+                  source: 'Console',
+                  statusText: type === 'warning' ? 'Warning' : 'Error',
+                  pageUrl: link.href,
+                  pageTitle: link.text,
+                  severity: type === 'warning' ? 'medium' : 'high'
+                });
+
+                // Log para debug se necessário
+                if (process.env.DEBUG_CONSOLE_ERRORS === 'true') {
+                  console.log(`[DEBUG] ✓ Console ${type} captured: ${errorType}`);
+                }
+              }
+            }
             
             // NOVO: Detectar erros de CORS mais específicos - PADRÕES APRIMORADOS
             if (type === 'error') {
@@ -322,7 +406,9 @@ export default async function runRequestsTest() {
               }
             }
           } catch (e) {
-            console.log(`[DEBUG] ✖ Error in consoleListener: ${e.message}`);
+            if (process.env.DEBUG_CONSOLE_ERRORS === 'true') {
+              console.log(`[DEBUG] ✖ Error in consoleListener: ${e.message}`);
+            }
           }
         };
         
@@ -332,8 +418,42 @@ export default async function runRequestsTest() {
         page.on('console', consoleListener);
 
         try {
+          // NOVO: Verificar sessão antes de cada navegação
+          const preNavUrl = page.url();
+          if (preNavUrl.includes('/login') || preNavUrl.includes('/sessao/expirada')) {
+            process.stdout.write(chalk.yellow(` ⚠ Sessão perdida\n`));
+            console.log(chalk.gray(`   └─ URL atual: ${preNavUrl}`));
+            totalErros++;
+            continue;
+          }
+          
           // Navegação rápida
           await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+          // NOVO: Verificar se foi redirecionado para login após navegação
+          const postNavUrl = page.url();
+          if (postNavUrl.includes('/login') || postNavUrl.includes('/sessao/expirada')) {
+            process.stdout.write(chalk.red(` ✖ Redirecionado para login\n`));
+            console.log(chalk.gray(`   └─ URL: ${link.href} → ${postNavUrl}`));
+            totalErros++;
+            
+            // NOVO: Tentar fazer login novamente se possível
+            if (LOGIN_CONFIG && LOGIN_CONFIG.username && LOGIN_CONFIG.password) {
+              try {
+                console.log(chalk.blue(`   Tentando relogar...`));
+                const reloginSuccess = await performLogin(page, LOGIN_CONFIG);
+                if (reloginSuccess) {
+                  console.log(chalk.green(`   ✓ Relogin bem-sucedido`));
+                  // Tentar navegar novamente
+                  await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                }
+              } catch (reloginError) {
+                console.log(chalk.red(`   ✖ Relogin falhou: ${reloginError.message}`));
+              }
+            }
+            
+            continue;
+          }
 
           // NOVO: janela total de teste por página
           const pageStart = Date.now();
@@ -383,9 +503,17 @@ export default async function runRequestsTest() {
               errorsByType[error.type].push(error);
             });
             
-            // Mostrar resumo por tipo de erro
+            // Mostrar resumo por tipo de erro com cores específicas
             Object.entries(errorsByType).forEach(([type, errors]) => {
-              console.log(chalk.gray(`     └─ ${type}: ${errors.length} erro(s)`));
+              let color = chalk.gray;
+              if (type.includes('JavaScript') || type.includes('TypeError') || type.includes('ReferenceError')) {
+                color = chalk.red;
+              } else if (type.includes('Warning') || type.includes('Google Maps')) {
+                color = chalk.yellow;
+              } else if (type.includes('CORS')) {
+                color = chalk.magenta;
+              }
+              console.log(color(`     └─ ${type}: ${errors.length} erro(s)`));
             });
             
             pageRequestErrors.forEach(error => {
@@ -411,8 +539,12 @@ export default async function runRequestsTest() {
             process.stdout.write(chalk.green(` ✓ OK\n`));
           }
         } catch (e) {
-          process.stdout.write(chalk.yellow(` ⚠ Falha na navegação\n`));
-          console.log(chalk.gray(`   └─ ${e.message.split('\n')[0]}`));
+          if (e.message.includes('net::ERR_ABORTED')) {
+            process.stdout.write(chalk.yellow(` ⚠ Navegação cancelada\n`));
+          } else {
+            process.stdout.write(chalk.yellow(` ⚠ Falha na navegação\n`));
+            console.log(chalk.gray(`   └─ ${e.message.split('\n')[0]}`));
+          }
           totalErros++;
         }
 
@@ -431,13 +563,29 @@ export default async function runRequestsTest() {
         
         let errorIndex = 1;
         for (const [key, errorData] of allErrors) {
-          console.log(chalk.red(`${errorIndex}. ${errorData.type}`));
+          // NOVO: Colorir diferentes tipos de erro
+          let errorColor = chalk.red;
+          if (errorData.type.includes('Warning')) {
+            errorColor = chalk.yellow;
+          } else if (errorData.type.includes('CORS')) {
+            errorColor = chalk.magenta;
+          } else if (errorData.type.includes('JavaScript')) {
+            errorColor = chalk.red.bold;
+          }
+          
+          console.log(errorColor(`${errorIndex}. ${errorData.type}`));
           if (errorData.status) console.log(chalk.yellow(`   Status: ${errorData.status} ${errorData.statusText || ''}`));
           if (errorData.method) console.log(chalk.blue(`   Método: ${errorData.method}`));
-          console.log(chalk.gray(`   URL: ${errorData.url}`));
-          if (errorData.error) console.log(chalk.gray(`   Motivo: ${errorData.error}`));
+          console.log(chalk.gray(`   URL/Arquivo: ${errorData.url}`));
+          if (errorData.error) {
+            const errorText = errorData.error.length > 150 
+              ? errorData.error.substring(0, 150) + '...'
+              : errorData.error;
+            console.log(chalk.gray(`   Detalhes: ${errorText}`));
+          }
           if (errorData.resourceType) console.log(chalk.cyan(`   Tipo: ${errorData.resourceType}`));
           if (errorData.source) console.log(chalk.magenta(`   Origem: ${errorData.source}`));
+          if (errorData.severity) console.log(chalk.cyan(`   Severidade: ${errorData.severity}`));
           console.log(chalk.blue(`   Ocorrências: ${errorData.count}x`));
           
           if (errorData.pages.length <= 3) {
@@ -449,7 +597,31 @@ export default async function runRequestsTest() {
           errorIndex++;
         }
         
-        console.log(chalk.red.bold(`📊 RESUMO: ${requestErrorCount} erros totais em ${allErrors.size} URLs diferentes`));
+        // NOVO: Resumo por categoria de erro
+        const errorsByCategory = {};
+        for (const [key, errorData] of allErrors) {
+          const category = errorData.type.includes('JavaScript') ? 'JavaScript' :
+                          errorData.type.includes('CORS') ? 'CORS' :
+                          errorData.type.includes('HTTP') ? 'HTTP' :
+                          errorData.type.includes('Network') ? 'Network' :
+                          errorData.type.includes('Warning') ? 'Warnings' : 'Others';
+          
+          if (!errorsByCategory[category]) errorsByCategory[category] = 0;
+          errorsByCategory[category] += errorData.count;
+        }
+        
+        if (Object.keys(errorsByCategory).length > 1) {
+          console.log(chalk.cyan.bold('📊 RESUMO POR CATEGORIA:'));
+          Object.entries(errorsByCategory).forEach(([category, count]) => {
+            const color = category === 'JavaScript' ? chalk.red :
+                         category === 'CORS' ? chalk.magenta :
+                         category === 'Warnings' ? chalk.yellow : chalk.gray;
+            console.log(color(`   ${category}: ${count} erro(s)`));
+          });
+          console.log('');
+        }
+        
+        console.log(chalk.red.bold(`📊 TOTAL: ${requestErrorCount} erros em ${allErrors.size} URLs diferentes`));
       } else {
         console.log(chalk.green.bold('\n✅ Nenhum erro de requisição encontrado!'));
       }

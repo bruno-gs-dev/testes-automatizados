@@ -29,10 +29,12 @@ const toList = (v) => {
 const LOGIN_FIND_TIMEOUT = toNum(process.env.LOGIN_FIND_TIMEOUT, 8000);
 const LOGIN_CONFIRM_TIMEOUT = toNum(process.env.LOGIN_CONFIRM_TIMEOUT, 12000);
 const LOGIN_DEBUG = toBool(process.env.LOGIN_DEBUG, false);
-// CORRIGIDO: Declarar LOGIN_REQUIRED corretamente
 const LOGIN_REQUIRED = toBool(process.env.LOGIN_REQUIRED, false);
-// NOVO: flag global para ignorar "Network Failure"
 const IGNORE_NETWORK_FAILURE = toBool(process.env.IGNORE_NETWORK_FAILURE, false);
+
+// NOVO: configurações de sessão
+const POST_LOGIN_WAIT = toNum(process.env.POST_LOGIN_WAIT, 3000);
+const NAVIGATION_DELAY = toNum(process.env.NAVIGATION_DELAY, 2000);
 
 // Lidos do .env - REMOVIDO: URL específica hardcoded
 export const URL_ALVO = process.env.URL_ALVO || 'https://exemplo.com/app';
@@ -59,6 +61,37 @@ export function normalizeColor(colorString) {
   return colorString.toLowerCase();
 }
 
+// Função helper para limpar valores do .env (remove \r\n\t e espaços)
+const cleanEnvValue = (value) => value ? value.replace(/[\r\n\t]/g, '').trim() : '';
+
+// Fallback: ler valor direto do arquivo .env quando process.env vier vazio (robusto em Windows)
+function getEnvSelector(key, defaultValue) {
+  const fromEnv = cleanEnvValue(process.env[key]);
+  if (fromEnv) return fromEnv;
+  try {
+    const envPath = path.join(__dirname, '.env');
+    if (!fs.existsSync(envPath)) return defaultValue;
+    const content = fs.readFileSync(envPath, 'utf8');
+    const lines = content.split(/\n|\r\n?/);
+    for (let rawLine of lines) {
+      if (!rawLine) continue;
+      const line = String(rawLine).trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIdx = line.indexOf('=');
+      if (eqIdx <= 0) continue;
+      const k = line.slice(0, eqIdx).trim();
+      if (k !== key) continue;
+      let val = line.slice(eqIdx + 1);
+      // remover comentários inline e aspas
+      const hashIdx = val.indexOf('#');
+      if (hashIdx >= 0) val = val.slice(0, hashIdx);
+      val = val.replace(/["']/g, '').replace(/[\r\n\t]/g, '').trim();
+      if (val) return val;
+    }
+  } catch { /* ignore */ }
+  return defaultValue;
+}
+
 // ATUALIZADO: Configuração de login centralizada (vinda do .env) - REMOVIDO: dados específicos
 export const LOGIN_CONFIG = {
   idVerificacao: toNum(process.env.LOGIN_ID_VERIFICACAO, null),
@@ -71,9 +104,11 @@ export const LOGIN_CONFIG = {
   username: process.env.LOGIN_USERNAME || '',
   password: process.env.LOGIN_PASSWORD || '',
   selectors: {
-    username: process.env.LOGIN_SELECTOR_USERNAME || 'input[type="email"], input[type="text"], input[name*="user"], input[name*="email"]',
-    password: process.env.LOGIN_SELECTOR_PASSWORD || 'input[type="password"]',
-    submit: process.env.LOGIN_SELECTOR_SUBMIT || 'button[type="submit"], input[type="submit"], button:contains("Entrar"), button:contains("Login")'
+    // Preferir valores do .env; se vierem vazios por parsing em Windows, tentar ler direto do arquivo .env
+    username: getEnvSelector('LOGIN_SELECTOR_USERNAME', '#form_j_username'),
+    password: getEnvSelector('LOGIN_SELECTOR_PASSWORD', '#form_j_password'),
+    // Removido :contains do default (não é suportado em querySelector)
+    submit: getEnvSelector('LOGIN_SELECTOR_SUBMIT', '#form_0')
   }
 };
 
@@ -87,7 +122,7 @@ export async function showStatus(page, text) {
         el.id = '__qa_status_overlay';
         el.setAttribute('data-qa-ignore', 'true');       // NOVO: ignorar nos testes
         el.setAttribute('aria-hidden', 'true');          // NOVO: acessibilidade
-        el.style.cssText = 'position:fixed;z-index:2147483647;top:10px;left:10px;background:rgba(0, 0, 255, 1);backdrop-filter:saturate(120%);color:#0b5fff;font:12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:8px 10px;border-radius:6px;box-shadow:0 2px 6px rgba(0, 0, 0, 1);pointer-events:none'; // NOVO: pointer-events none
+        el.style.cssText = 'position:fixed;z-index:2147483647;top:10px;left:10px;background:rgba(0, 0, 255, 1);backdrop-filter:saturate(120%);color:#fff;font:12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:8px 10px;border-radius:6px;box-shadow:0 2px 6px rgba(0, 0, 0, 1);pointer-events:none'; // NOVO: pointer-events none
         document.body.appendChild(el);
       } else {
         el.setAttribute('data-qa-ignore', 'true');
@@ -252,7 +287,7 @@ export async function detectApplicationType(page) {
   return types;
 }
 
-// ATUALIZADO: função de login mais genérica - CORRIGIDO: melhor suporte para input[type="submit"]
+// ATUALIZADO: função de login mais genérica - CORRIGIDO: melhor estabilização da sessão
 export async function performLogin(page, loginConfig) {
   const baseUrl = loginConfig.url;
   const expectedPath = loginConfig.expectedPath || '/';
@@ -397,10 +432,14 @@ export async function performLogin(page, loginConfig) {
   }
 
   // CORRIGIDO: Priorizar seletor do .env se disponível e válido
-  const envSubmitSel = loginConfig.selectors.submit &&
-    loginConfig.selectors.submit.trim() &&
-    !loginConfig.selectors.submit.includes(':contains(')
-    ? loginConfig.selectors.submit.trim()
+  // NOVO: Trim agressivo para remover \r\n e espaços
+  const rawSubmitSel = loginConfig.selectors.submit;
+  const cleanSubmitSel = rawSubmitSel ? rawSubmitSel.replace(/[\r\n\t]/g, '').trim() : null;
+  
+  const envSubmitSel = cleanSubmitSel &&
+    cleanSubmitSel.length > 0 &&
+    !cleanSubmitSel.includes(':contains(')
+    ? cleanSubmitSel
     : null;
 
   // Fallback detectado no DOM (autodetect + padrões)
@@ -829,6 +868,20 @@ export async function performLogin(page, loginConfig) {
       if (pathOk || (markers.inApp && !markers.hasLogin)) {
         await showStatus(page, 'Login realizado com sucesso.');
         console.log(chalk.green('✅ Login confirmado com sucesso!'));
+        
+        // NOVO: Aguardar um tempo após login para estabilizar a sessão
+        if (POST_LOGIN_WAIT > 0) {
+          if (LOGIN_DEBUG) console.log(chalk.gray(`[LOGIN] Aguardando ${POST_LOGIN_WAIT}ms para estabilizar sessão...`));
+          await new Promise(r => setTimeout(r, POST_LOGIN_WAIT));
+          
+          // NOVO: Verificar se a sessão ainda está válida após a espera
+          const sessionUrl = page.url();
+          if (sessionUrl.includes('/login') || sessionUrl.includes('/sessao/expirada')) {
+            if (LOGIN_DEBUG) console.log(chalk.yellow(`[LOGIN] Sessão expirou durante a espera: ${sessionUrl}`));
+            return false;
+          }
+        }
+        
         return true;
       }
 
@@ -1027,7 +1080,23 @@ export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = 
 
         if (currentPath !== targetPath && !currentUrl.includes(targetPath)) {
           console.log(chalk.gray(`Navegando para URL alvo específica: ${url}`));
+          
+          // NOVO: Aguardar antes de navegar para não perder a sessão
+          await safeNavigationDelay();
+          
+          // NOVO: Verificar se sessão ainda é válida antes de navegar
+          const preNavUrl = page.url();
+          if (preNavUrl.includes('/login') || preNavUrl.includes('/sessao/expirada')) {
+            throw new Error(`Sessão perdida antes de navegar para URL alvo: ${preNavUrl}`);
+          }
+          
           await page.goto(url, { waitUntil: 'networkidle2' });
+          
+          // NOVO: Verificar se não foi redirecionado para login após navegação
+          const postNavUrl = page.url();
+          if (postNavUrl.includes('/login') || postNavUrl.includes('/sessao/expirada')) {
+            throw new Error(`Redirecionado para login após navegar: ${postNavUrl}`);
+          }
         } else {
           console.log(chalk.gray(`✅ Já na página correta após login: ${currentUrl}`));
         }
@@ -1039,12 +1108,15 @@ export async function prepareBrowserPage(url, launchOptions = {}, loginConfig = 
       await page.goto(url, { waitUntil: 'networkidle2' });
     }
 
-    // NOVO: Verificar se chegou na URL esperada (mais tolerante)
+    // NOVO: Verificação final mais rigorosa com detalhes
     const finalUrl = page.url();
     if (LOGIN_REQUIRED && (finalUrl.includes('/sessao/expirada') || finalUrl.includes('/login'))) {
       throw new Error(`Sistema requer login mas redirecionou para: ${finalUrl}`);
     }
 
+    // NOVO: Aguardar um pouco para garantir que a página esteja estável
+    await new Promise(r => setTimeout(r, 1000));
+    
     await showStatus(page, 'Página carregada.');
   } catch (error) {
     await browser.close();

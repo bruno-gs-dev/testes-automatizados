@@ -56,13 +56,19 @@ export async function discoverLinks(page) {
         const text = (a.innerText || a.textContent || '').trim();
         const href = a.href;
         
+        // Validação completa de link navegável
         if (href && 
             href !== '#' && 
             href !== '' && 
             href !== 'javascript:void(0)' && 
+            href !== 'javascript:;' &&
+            !href.endsWith('#') &&
+            !href.startsWith('#') &&
             href.startsWith(window.location.origin) && 
             text && 
-            text.length > 0) {
+            text.trim().length > 0 &&
+            !text.toLowerCase().includes('sair') &&
+            !text.toLowerCase().includes('logout')) {
           links.push({ text, href });
         }
       });
@@ -148,13 +154,19 @@ export async function discoverLinks(page) {
                 const text = (a.innerText || a.textContent || '').trim();
                 const href = a.href;
                 
+                // Validação completa de link navegável
                 if (href && 
                     href !== '#' && 
                     href !== '' && 
                     href !== 'javascript:void(0)' && 
+                    href !== 'javascript:;' &&
+                    !href.endsWith('#') &&
+                    !href.startsWith('#') &&
                     href.startsWith(window.location.origin) && 
                     text && 
-                    text.length > 0) {
+                    text.trim().length > 0 &&
+                    !text.toLowerCase().includes('sair') &&
+                    !text.toLowerCase().includes('logout')) {
                   links.push({ text, href });
                 }
               });
@@ -217,13 +229,19 @@ export async function discoverLinks(page) {
                         const text = (a.innerText || a.textContent || '').trim();
                         const href = a.href;
                         
+                        // Validação completa de link navegável
                         if (href && 
                             href !== '#' && 
                             href !== '' && 
                             href !== 'javascript:void(0)' && 
+                            href !== 'javascript:;' &&
+                            !href.endsWith('#') &&
+                            !href.startsWith('#') &&
                             href.startsWith(window.location.origin) && 
                             text && 
-                            text.length > 0) {
+                            text.trim().length > 0 &&
+                            !text.toLowerCase().includes('sair') &&
+                            !text.toLowerCase().includes('logout')) {
                           links.push({ text, href });
                         }
                       });
@@ -270,14 +288,19 @@ export async function discoverLinks(page) {
           const text = (a.innerText || a.textContent || '').trim();
           const href = a.href;
           
+          // Validação completa de link navegável
           if (href && 
               href !== '#' && 
               href !== '' && 
               href !== 'javascript:void(0)' && 
+              href !== 'javascript:;' &&
+              !href.endsWith('#') &&
+              !href.startsWith('#') &&
               href.startsWith(window.location.origin) && 
               text && 
-              text.length > 0 && 
-              text.toLowerCase() !== 'sair') {
+              text.trim().length > 0 &&
+              !text.toLowerCase().includes('sair') &&
+              !text.toLowerCase().includes('logout')) {
             links.push({ text, href });
           }
         } catch (e) {
@@ -308,7 +331,21 @@ export async function discoverLinks(page) {
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
     const linksFile = path.join(__dirname, 'links_map.json');
-    fs.writeFileSync(linksFile, JSON.stringify(uniqueLinks, null, 2), 'utf8');
+    
+    // NOVO: Validação final dos links antes de salvar
+    const validLinksForSaving = uniqueLinks.filter(link => {
+      return link && 
+             link.href && 
+             !link.href.endsWith('#') && 
+             !link.href.startsWith('#') && 
+             link.href !== '#' && 
+             link.text && 
+             link.text.trim().length > 0;
+    });
+    
+    console.log(chalk.gray(`Salvando ${validLinksForSaving.length} links válidos (de ${uniqueLinks.length} encontrados)`));
+    
+    fs.writeFileSync(linksFile, JSON.stringify(validLinksForSaving, null, 2), 'utf8');
     console.log(chalk.gray(`Links de navegação salvos em: ${linksFile}`));
   } catch (e) {
     console.log(chalk.yellow('Aviso: falha ao salvar links_map.json:'), e.message.split('\n')[0]);
@@ -362,9 +399,20 @@ export default async function runNavigationTest(onlyDiscover = false) {
       console.log(`Testando ${logPrefix}`); // Deixei os logs de navegação visíveis aqui
 
       try {
+        // NOVO: Verificar se o link é válido antes de tentar navegar
+        if (link.href.endsWith('#') || link.href.startsWith('#') || link.href === '#') {
+          throw new Error(`Link inválido detectado: "${link.href}" - âncora vazia ou fragmento`);
+        }
+        
+        const currentUrlBefore = page.url();
         const response = await page.goto(link.href, { waitUntil: 'networkidle2' });
         const status = response ? response.status() : 'unknown';
         const url = page.url();
+        
+        // NOVO: Verificar se realmente mudou de página
+        if (url === currentUrlBefore && link.href.endsWith('#')) {
+          throw new Error(`Navegação não efetiva - link "${link.href}" não mudou a página atual`);
+        }
 
         if (!response || !response.ok() || url.includes('login') || url.includes('error')) {
           throw new Error(`Status ${status} ou redirecionamento para página de login/erro.`);
