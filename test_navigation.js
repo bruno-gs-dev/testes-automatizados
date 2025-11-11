@@ -20,12 +20,13 @@ export async function discoverLinks(page) {
     throw new Error(`Página não válida para descoberta de links: ${currentUrl}. Verifique se o login foi bem-sucedido.`);
   }
   
-  // NOVO: Detectar tipo de aplicação e usar seletores apropriados
+  // CORRIGIDO: Detectar tipo de aplicação apenas UMA VEZ e usar seletores apropriados
   const appType = await detectApplicationType(page);
   const selectors = getCustomSelectors();
   
-  console.log(chalk.gray(`Tipo de aplicação detectado: ${appType}`));
-  console.log(chalk.gray(`Usando seletores: ${JSON.stringify(selectors, null, 2)}`));
+  console.log(chalk.gray(`Usando seletores configurados:`));
+  console.log(chalk.gray(`  Painel principal: ${selectors.mainPanel}`));
+  console.log(chalk.gray(`  Itens de navegação: ${selectors.mainItems}`));
   
   const discoveredLinks = new Map();
   
@@ -280,36 +281,84 @@ export async function discoverLinks(page) {
   } else {
     // Lógica genérica para outros tipos de aplicação
     console.log(chalk.blue('Usando lógica genérica de navegação'));
-    
-    const allLinks = await page.evaluate(() => {
-      const links = [];
-      document.querySelectorAll('a[href]').forEach(a => {
+
+    // CORRIGIDO: respeitar NAV_MAIN_PANEL_SELECTOR e NAV_MAIN_ITEMS_SELECTOR do .env/config
+    // Compatível com Shadow DOM (busca profunda)
+    const result = await page.evaluate((selectors) => {
+      const deepQuerySelectorAll = (root, selector) => {
+        const out = [];
+        const visit = (node) => {
+          try {
+            out.push(...node.querySelectorAll(selector));
+          } catch { /* selector pode ser inválido */ }
+          const walk = (container) => {
+            const children = container.children ? Array.from(container.children) : [];
+            for (const el of children) {
+              if (el.shadowRoot) {
+                visit(el.shadowRoot);
+              }
+              // também descer normalmente para alcançar shadow hosts aninhados
+              walk(el);
+            }
+          };
+          walk(node);
+        };
+        visit(root);
+        return out;
+      };
+
+      const deepQuerySelector = (root, selector) => {
         try {
-          const text = (a.innerText || a.textContent || '').trim();
-          const href = a.href;
-          
-          // Validação completa de link navegável
-          if (href && 
-              href !== '#' && 
-              href !== '' && 
-              href !== 'javascript:void(0)' && 
-              href !== 'javascript:;' &&
-              !href.endsWith('#') &&
-              !href.startsWith('#') &&
-              href.startsWith(window.location.origin) && 
-              text && 
-              text.trim().length > 0 &&
-              !text.toLowerCase().includes('sair') &&
-              !text.toLowerCase().includes('logout')) {
+          const direct = root.querySelector(selector);
+          if (direct) return direct;
+        } catch { /* ignore */ }
+        const all = deepQuerySelectorAll(root, selector);
+        return all.length ? all[0] : null;
+      };
+
+      let foundWhere = 'não definido';
+      let panel = null;
+      if (selectors && selectors.mainPanel) {
+        panel = deepQuerySelector(document, selectors.mainPanel);
+        foundWhere = panel ? (panel.getRootNode() instanceof ShadowRoot ? 'shadow DOM' : 'documento principal') : 'não encontrado';
+      }
+
+      const root = panel
+        ? (panel.shadowRoot ? panel.shadowRoot : panel)
+        : document;
+
+      const candidates = (selectors && selectors.mainItems)
+        ? deepQuerySelectorAll(root, selectors.mainItems)
+        : deepQuerySelectorAll(root, 'a[href]');
+
+      const links = [];
+      for (const node of candidates) {
+        try {
+          const anchor = node.matches && node.matches('a[href]') ? node : (node.querySelector ? node.querySelector('a[href]') : null);
+          if (!anchor) continue;
+          const text = (anchor.innerText || anchor.textContent || '').trim();
+          const href = anchor.href;
+          if (href && href !== '#' && href !== '' && href !== 'javascript:void(0)' && href !== 'javascript:;'
+              && !href.endsWith('#') && !href.startsWith('#') && href.startsWith(window.location.origin)
+              && text && text.trim().length > 0 && !text.toLowerCase().includes('sair') && !text.toLowerCase().includes('logout')) {
             links.push({ text, href });
           }
-        } catch (e) {
-          // Ignora elementos problemáticos
-        }
-      });
-      return links;
-    });
-    
+        } catch { /* ignore */ }
+      }
+
+      // Dedupe
+      const seen = new Set();
+      const unique = links.filter(l => !seen.has(l.href) && seen.add(l.href));
+      return { links: unique, foundWhere };
+    }, selectors);
+
+    const allLinks = result.links || [];
+    const foundWhere = result.foundWhere || 'desconhecido';
+
+    // MELHORADO: Debug mais claro sobre o que foi encontrado
+    console.log(chalk.gray(`Painel principal (${selectors.mainPanel}): ${foundWhere}`));
+    console.log(chalk.gray(`Coletados ${allLinks.length} links candidatos`));
+
     allLinks.forEach(link => {
       if (!discoveredLinks.has(link.href)) {
         discoveredLinks.set(link.href, link);

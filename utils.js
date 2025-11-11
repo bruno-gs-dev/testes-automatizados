@@ -253,17 +253,25 @@ export const getNavConfig = () => {
 export const getCustomSelectors = () => {
   const navConfig = getNavConfig();
 
-  return {
-    mainPanel: process.env.NAV_MAIN_PANEL_SELECTOR || navConfig.mainPanelSelector,
-    mainItems: process.env.NAV_MAIN_ITEMS_SELECTOR || navConfig.mainItemsSelector,
-    asideWrapper: process.env.NAV_ASIDE_WRAPPER_SELECTOR || navConfig.asideWrapperSelector,
-    finalLink: process.env.NAV_FINAL_LINK_SELECTOR || navConfig.finalLinkSelector,
-    collapsable: process.env.NAV_COLLAPSABLE_SELECTOR || navConfig.collapsableSelector,
-    clickTarget: process.env.NAV_CLICK_TARGET_SELECTOR || navConfig.clickTargetSelector
+  // CORRIGIDO: Usar o mesmo fallback robusto de leitura do .env (como nos seletores de login)
+  const envOrDefault = (key, defVal) => {
+    const envValue = getEnvSelector(key, null);
+    return envValue || defVal;
   };
+
+  const selectors = {
+    mainPanel: envOrDefault('NAV_MAIN_PANEL_SELECTOR', navConfig.mainPanelSelector),
+    mainItems: envOrDefault('NAV_MAIN_ITEMS_SELECTOR', navConfig.mainItemsSelector),
+    asideWrapper: envOrDefault('NAV_ASIDE_WRAPPER_SELECTOR', navConfig.asideWrapperSelector),
+    finalLink: envOrDefault('NAV_FINAL_LINK_SELECTOR', navConfig.finalLinkSelector),
+    collapsable: envOrDefault('NAV_COLLAPSABLE_SELECTOR', navConfig.collapsableSelector),
+    clickTarget: envOrDefault('NAV_CLICK_TARGET_SELECTOR', navConfig.clickTargetSelector)
+  };
+
+  return selectors;
 };
 
-// NOVO: Detectar tipo de aplicação automaticamente
+// CORRIGIDO: Detectar tipo de aplicação automaticamente - remover log duplicado
 export async function detectApplicationType(page) {
   const types = await page.evaluate(() => {
     const checks = {
@@ -283,6 +291,7 @@ export async function detectApplicationType(page) {
     return 'generic';
   });
 
+  // CORRIGIDO: Log apenas uma vez e com informações mais úteis
   console.log(chalk.gray(`Tipo de aplicação detectado: ${types}`));
   return types;
 }

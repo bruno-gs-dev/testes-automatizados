@@ -35,7 +35,7 @@ Edite o arquivo `.env` com os dados da sua aplicação:
 ```env
 # URLs da sua aplicação
 URL_ALVO=https://sua-aplicacao.com/app/home
-BASE_URL=https://sua-aplicacao.com/
+BASE_URL=https://sua-aplicacao.com/login
 EXPECTED_PATH=/app/home
 
 # Suas credenciais
@@ -43,9 +43,10 @@ LOGIN_USERNAME=seu.usuario
 LOGIN_PASSWORD=suasenha123
 
 # Seletores de login (o sistema tenta detectar automaticamente)
+# Evite :contains() — use seletores CSS válidos
 LOGIN_SELECTOR_USERNAME=#email
 LOGIN_SELECTOR_PASSWORD=#password
-LOGIN_SELECTOR_SUBMIT=button:contains('Entrar')
+LOGIN_SELECTOR_SUBMIT=button[type="submit"]
 ```
 
 ### 2. Configuração Automática
@@ -76,34 +77,34 @@ NAV_MAIN_ITEMS_SELECTOR=a, .nav-item
 ```bash
 # 1. Configure o .env com os dados da sua aplicação
 # 2. Execute o teste de navegação para mapear as rotas
-npm run start navigation
+node index.js navigation
 
 # 3. Execute a suíte completa em todas as páginas
-npm run start all-pages
+npm run all-pages
 ```
 
 ### Testes Individuais
 ```bash
 # Teste de cores apenas
-npm run start colors
+node index.js colors
 
 # Teste de textos apenas
-npm run start text
+node index.js text
 
 # Teste de requisições apenas
-npm run start requests
+node index.js requests
 
 # Teste de navegação (mapear rotas)
-npm run start navigation
+node index.js navigation
 ```
 
 ### Suítes Completas
 ```bash
 # Todos os testes em uma única página
-npm run start all
+node index.js all
 
 # Todos os testes em TODAS as páginas (recomendado)
-npm run start all-pages
+npm run all-pages
 ```
 
 ## 📊 Exemplos de Relatórios
@@ -157,7 +158,7 @@ LOGIN_SELECTOR_USERNAME=#meu-campo-usuario
 - Relatório consolidado por tipo de erro
 
 ### 🧭 Teste de Navegação
-- **Mapeia automaticamente** todas as rotas
+- Mapeia automaticamente todas as rotas
 - Funciona com SPAs e aplicações tradicionais
 - Expande menus recursivamente
 - Testa acesso individual a cada página
@@ -187,7 +188,7 @@ NAV_MAIN_PANEL_SELECTOR=.seu-menu-customizado
 # Use seletores mais específicos
 LOGIN_SELECTOR_USERNAME=input[type="email"]
 LOGIN_SELECTOR_PASSWORD=input[type="password"]
-LOGIN_SELECTOR_SUBMIT=button:contains('Login')
+LOGIN_SELECTOR_SUBMIT=button[type="submit"]
 # Ou teste com interface visual
 HEADLESS=false
 ```
